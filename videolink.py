@@ -2,11 +2,12 @@
 """Grab a video link from a web page and copy it to the clipboard.
 
 Keybind flow (macOS): copy a page URL, hit your hotkey. This reads the URL
-from the clipboard, asks yt-dlp what videos are on the page, copies the link
-(or shows a picker if there are several), and posts a notification.
+from the clipboard, asks yt-dlp what videos are on the page, copies the link,
+opens it in IINA (or shows a picker first if there are several), and posts a
+notification.
 
 Usage:
-    videolink.py [url] [--cookies-from-browser BROWSER] [--html]
+    videolink.py [url] [--cookies-from-browser BROWSER] [--html] [--subtitle-prompt|--subtitle-auto]
 
 If no url is given it reads one from the clipboard.
 --cookies-from-browser chrome|safari|firefox|edge|brave|chromium|opera|vivaldi
@@ -14,6 +15,10 @@ If no url is given it reads one from the clipboard.
     browser's login cookies. (--cookies-from is kept as an alias.)
 --html  copy an <a href> anchor tag instead of the plain URL (for rich-text
     targets like email or a CMS).
+--subtitle-prompt  offer to open IINA with live subtitles through the local
+    subtitle service if it is running.
+--subtitle-auto  start live subtitles automatically (no confirmation dialog)
+    when the local subtitle service is running and a backend is available.
 --sweep-test [--seed N]  developer smoke test: run the extractor against a random
     sample of 50 news + 50 general public sites and print a summary. Copies
     nothing. --seed makes the site selection reproducible.
@@ -22,16 +27,20 @@ If no url is given it reads one from the clipboard.
 from __future__ import annotations
 
 import re
+import os
 import sys
 import html
+import json
 import time
+import uuid
 import random
 import shutil
 import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import yt_dlp
@@ -52,6 +61,26 @@ EMBED_URL_PATTERNS = (
 VIMEO_EMBED_PATTERN = re.compile(r"player\.vimeo\.com/video/(\d+)", re.I)
 # data-video-id is non-standard, so only trust it when the page clearly uses YouTube.
 DATA_VIDEO_ID_PATTERN = re.compile(rf'data-video-id=["\']({_YT_ID})["\']', re.I)
+DIRECT_VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".webm",
+    ".mov",
+    ".m4v",
+    ".avi",
+    ".mkv",
+    ".flv",
+    ".wmv",
+    ".m3u8",
+    ".mpd",
+)
+DIRECT_VIDEO_PATTERN = re.compile(
+    rf"({'|'.join(re.escape(extension) for extension in DIRECT_VIDEO_EXTENSIONS)})(?:$|[?#&=/])",
+    re.I,
+)
+DIRECT_MEDIA_EXTRACTORS = {"Generic", "HTML5MediaEmbed"}
+FRAGILE_RESOLVED_MEDIA_HOSTS = {"bild.cdn.content-discovery.video"}
+PREFERRED_PAGE_DELIVERY_HOSTS = {"hds.ak.token.bild.de"}
+DELIVERY_MARKER_PATTERN = re.compile(r"(?:,|[?&])delivery=(hls|mpd|pmd)\b", re.I)
 
 # Second-stage fallback: narrow patterns for the big hosted players (Brightcove,
 # JWPlayer, Kaltura). We only turn these into canonical URLs that yt-dlp's own
@@ -92,6 +121,11 @@ SUPPORTED_BROWSERS = (
 # A web page that pulls in lots of requests can take a long time. A keybind
 # tool must never hang, so we abandon extraction after this many seconds.
 EXTRACT_TIMEOUT_SECONDS = 12
+SUBTITLE_SERVICE_URL = os.environ.get(
+    "VIDEOLINK_SUBTITLE_SERVICE",
+    "http://127.0.0.1:8765",
+).rstrip("/")
+IINA_BUNDLED_CLI = "/Applications/IINA.app/Contents/MacOS/iina-cli"
 
 
 class QuietLogger:
@@ -119,6 +153,67 @@ YDL_OPTS = {
 }
 
 
+class HTMLMediaSourceParser(HTMLParser):
+    """Collect direct media URLs from ordinary HTML media/meta tags."""
+
+    def __init__(self, page_url: str):
+        super().__init__(convert_charrefs=True)
+        self.page_url = page_url
+        self.sources: list[tuple[str, str]] = []
+        self.json_ld_blocks: list[str] = []
+        self._in_json_ld = False
+        self._json_ld_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key.lower(): value for key, value in attrs if value is not None}
+        tag = tag.lower()
+
+        if tag == "script" and "ld+json" in (values.get("type") or "").lower():
+            self._in_json_ld = True
+            self._json_ld_parts = []
+            return
+
+        if tag in {"source", "video"}:
+            self.add_source(
+                values.get("src"),
+                values.get("title") or values.get("label") or values.get("res") or values.get("type"),
+            )
+            return
+
+        if tag == "meta":
+            meta_name = (values.get("property") or values.get("name") or "").lower()
+            if meta_name in {
+                "og:video",
+                "og:video:url",
+                "og:video:secure_url",
+                "twitter:player:stream",
+            }:
+                self.add_source(values.get("content"), meta_name)
+
+    def handle_data(self, data: str) -> None:
+        if self._in_json_ld:
+            self._json_ld_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._in_json_ld:
+            block = "".join(self._json_ld_parts).strip()
+            if block:
+                self.json_ld_blocks.append(block)
+            self._in_json_ld = False
+            self._json_ld_parts = []
+
+    def add_source(self, raw_url: str | None, label: str | None) -> None:
+        if not raw_url:
+            return
+        try:
+            media_url = urljoin(self.page_url, html.unescape(raw_url.strip()))
+        except ValueError:
+            return
+        if looks_like_direct_media_url(media_url):
+            title = f"Direct media {label}".strip() if label else "Direct media"
+            self.sources.append((title, media_url))
+
+
 # --- platform glue (clipboard + notifications, macOS first) ------------------
 
 def read_clipboard() -> str:
@@ -140,6 +235,46 @@ def copy_to_clipboard(text: str) -> bool:
                 return True
             except (OSError, subprocess.CalledProcessError):
                 continue
+    return False
+
+
+def iina_cli_commands(url: str, mpv_args: list[str]) -> list[list[str]]:
+    commands = []
+    window_args = ["--separate-windows"] if mpv_args else []
+
+    for cli_name in ("iina", "iina-cli"):
+        cli_path = shutil.which(cli_name)
+        if cli_path:
+            commands.append([cli_path, "--no-stdin", *window_args, *mpv_args, url])
+
+    if sys.platform == "darwin" and os.path.exists(IINA_BUNDLED_CLI):
+        commands.append([IINA_BUNDLED_CLI, "--no-stdin", *window_args, *mpv_args, url])
+
+    return commands
+
+
+def open_in_iina(url: str, ipc_path: str | None = None) -> bool:
+    mpv_args = [f"--mpv-input-ipc-server={ipc_path}"] if ipc_path else []
+    commands = iina_cli_commands(url, mpv_args)
+
+    # The macOS `open -a ... --args` path does not reliably pass mpv IPC options
+    # to IINA, so use it only when subtitles are not requested.
+    fallback_commands: list[list[str]] = []
+    if not ipc_path and sys.platform == "darwin" and shutil.which("open"):
+        fallback_commands.append(["open", "-a", "IINA", url])
+
+    for command in [*commands, *fallback_commands]:
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except (OSError, subprocess.CalledProcessError):
+            continue
+
     return False
 
 
@@ -199,6 +334,22 @@ def applescript_string(value: str) -> str:
     return f'"{escaped}"'
 
 
+def make_iina_ipc_path() -> str:
+    # Not tempfile.gettempdir(): when this runs from a macOS Shortcuts "Run
+    # Shell Script" action, $TMPDIR points into that helper's own sandboxed
+    # container, which IINA (a separate, unrelated app) cannot bind a socket
+    # into — mpv silently fails to create it there. /tmp is the classic
+    # shared, non-sandboxed location every app can read and write.
+    path = os.path.join("/tmp", f"vl-{uuid.uuid4().hex[:8]}.sock")
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    return path
+
+
+
+
 # --- core --------------------------------------------------------------------
 
 def normalize_page_url(raw_url: str) -> str:
@@ -211,6 +362,33 @@ def normalize_page_url(raw_url: str) -> str:
 def looks_like_url(value: str) -> bool:
     parsed = urlparse(value)
     return bool(parsed.scheme in {"http", "https"} and parsed.netloc and "." in parsed.netloc)
+
+
+def looks_like_direct_media_url(value: str | None) -> bool:
+    if not value:
+        return False
+
+    normalized = html.unescape(value).lower()
+
+    if any(character in normalized for character in "\"'<>"):
+        return False
+
+    try:
+        parsed = urlparse(normalized)
+    except ValueError:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    if parsed.path.endswith(DIRECT_VIDEO_EXTENSIONS):
+        return True
+
+    return (
+        bool(DIRECT_VIDEO_PATTERN.search(normalized))
+        or "delivery=hls" in normalized
+        or "delivery=mpd" in normalized
+    )
 
 
 def extract_videos(page_url: str, cookies_browser: str | None) -> list[tuple[str, str]]:
@@ -232,11 +410,23 @@ def extract_videos_traced(
        results are deduped after.
     """
     videos = ydl_extract(page_url, cookies_browser)
+    page = ""
+
+    if videos and has_fragile_resolved_media_url(videos):
+        page = fetch_html(page_url)
+        delivery_videos = discover_page_delivery_videos(page, page_url)
+        if delivery_videos:
+            return delivery_videos, "fallback"
+
     if videos:
         return videos, "primary"
 
-    page = fetch_html(page_url)
+    page = page or fetch_html(page_url)
     if page:
+        direct_videos = discover_html_media_sources(page, page_url)
+        if direct_videos:
+            return direct_videos, "fallback"
+
         for discover in (discover_embedded_urls, discover_player_urls):
             found: list[tuple[str, str]] = []
             for candidate_url in discover(page):
@@ -266,12 +456,180 @@ def ydl_extract(target_url: str, cookies_browser: str | None) -> list[tuple[str,
     for item in items:
         if not item:
             continue
+        direct_formats = direct_media_formats(item)
+        if direct_formats:
+            title = item.get("title") or item.get("webpage_url") or target_url
+            for fmt in direct_formats:
+                videos.append((format_title(title, fmt), fmt["url"]))
+            continue
+
         # webpage_url is durable and always present when we found something;
         # direct format URLs aren't always available and tend to expire.
         url = item.get("webpage_url") or item.get("url")
         if url:
             videos.append((item.get("title") or url, url))
     return dedupe_videos(videos)
+
+
+def resolve_direct_media_url(url: str, cookies_browser: str | None) -> str | None:
+    """Best-effort: resolve a chosen video to a directly-streamable URL.
+
+    For most sites, ydl_extract() intentionally returns the durable webpage_url
+    instead of a format URL (see the comment above) so a copied/pasted link
+    doesn't expire. IINA can usually still open that page URL itself (it has
+    its own bundled resolver), but ffmpeg (used by the subtitle pipeline)
+    cannot, and IINA's own resolver is sometimes slower or less capable than
+    ours — e.g. it can leave the mpv IPC socket unbound for longer than we
+    wait for it. So when live subtitles are requested, we re-resolve here and
+    hand IINA/the subtitle service a real stream URL instead.
+    """
+    if looks_like_direct_media_url(url):
+        return url
+
+    opts = dict(YDL_OPTS)
+    if cookies_browser:
+        opts["cookiesfrombrowser"] = (cookies_browser,)
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.sanitize_info(ydl.extract_info(url, download=False))
+    except yt_dlp.utils.DownloadError:
+        return None
+
+    if info.get("entries"):
+        return None  # a playlist/picker page; the caller already chose one video
+
+    candidate = info.get("url")
+    if looks_like_direct_media_url(candidate):
+        return candidate
+
+    for fmt in info.get("formats") or []:
+        if isinstance(fmt, dict) and looks_like_direct_media_url(fmt.get("url")):
+            candidate = fmt["url"]
+    return candidate if looks_like_direct_media_url(candidate) else None
+
+
+def resolve_direct_media_url_with_timeout(url: str, cookies_browser: str | None) -> str | None:
+    """Same timeout guarantee as extract_with_timeout: never hang the keybind."""
+    result: dict[str, object] = {}
+
+    def worker():
+        try:
+            result["url"] = resolve_direct_media_url(url, cookies_browser)
+        except Exception:
+            result["url"] = None
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(EXTRACT_TIMEOUT_SECONDS)
+    return result.get("url") if not thread.is_alive() else None
+
+
+def direct_media_formats(item: dict) -> list[dict]:
+    """Direct media URLs from wrapper-page extractors, not canonical platforms."""
+    if item.get("extractor_key") not in DIRECT_MEDIA_EXTRACTORS:
+        return []
+
+    formats = [
+        fmt
+        for fmt in item.get("formats") or []
+        if isinstance(fmt, dict) and looks_like_direct_media_url(fmt.get("url"))
+    ]
+
+    if formats:
+        return formats
+
+    url = item.get("url")
+    if looks_like_direct_media_url(url):
+        return [{"url": url, "format_id": item.get("format_id"), "ext": item.get("ext")}]
+
+    return []
+
+
+def format_title(title: str, fmt: dict) -> str:
+    details = []
+
+    if fmt.get("format_id"):
+        details.append(str(fmt["format_id"]))
+    if fmt.get("height"):
+        details.append(f'{fmt["height"]}p')
+    if fmt.get("ext"):
+        details.append(str(fmt["ext"]))
+
+    return f"{title} ({', '.join(details)})" if details else title
+
+
+def has_fragile_resolved_media_url(videos: list[tuple[str, str]]) -> bool:
+    return any(is_fragile_resolved_media_url(url) for _title, url in videos)
+
+
+def is_fragile_resolved_media_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+
+    return (parsed.hostname or "").lower() in FRAGILE_RESOLVED_MEDIA_HOSTS
+
+
+def discover_page_delivery_videos(page: str, page_url: str) -> list[tuple[str, str]]:
+    urls = discover_page_delivery_urls(page, page_url)
+    return [(delivery_title(url), url) for url in urls]
+
+
+def discover_page_delivery_urls(page: str, page_url: str) -> list[str]:
+    decoded_page = html.unescape(page).replace("\\/", "/")
+    url_pattern = re.compile(
+        r"""(?:"|')?((?:https?:)?//[^"'<>\\\s]+|/[^"'<>\\\s]+)(?:"|')?""",
+        re.I,
+    )
+    urls: list[str] = []
+
+    for match in url_pattern.findall(decoded_page):
+        candidate = clean_candidate_url(match)
+        if candidate.startswith("//"):
+            candidate = "https:" + candidate
+
+        try:
+            full_url = urljoin(page_url, candidate)
+        except ValueError:
+            continue
+
+        if is_preferred_page_delivery_url(full_url):
+            urls.append(full_url)
+
+    urls = dedupe_preserve(urls)
+    hls_urls = [url for url in urls if delivery_kind(url) == "hls"]
+    return hls_urls or sorted(urls, key=delivery_sort_key)
+
+
+def clean_candidate_url(value: str) -> str:
+    return html.unescape(value).strip().rstrip("),.;]}")
+
+
+def is_preferred_page_delivery_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+
+    hostname = (parsed.hostname or "").lower()
+    return hostname in PREFERRED_PAGE_DELIVERY_HOSTS and delivery_kind(url) is not None
+
+
+def delivery_kind(url: str) -> str | None:
+    match = DELIVERY_MARKER_PATTERN.search(html.unescape(url).lower())
+    return match.group(1) if match else None
+
+
+def delivery_sort_key(url: str) -> tuple[int, str]:
+    order = {"hls": 0, "mpd": 1, "pmd": 2}
+    return order.get(delivery_kind(url) or "", 3), url
+
+
+def delivery_title(url: str) -> str:
+    kind = delivery_kind(url)
+    return f"BILD delivery {kind.upper()}" if kind else "BILD delivery"
 
 
 def dedupe_videos(videos: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -325,9 +683,110 @@ def fetch_html(page_url: str) -> str:
         request = Request(page_url, headers={"User-Agent": BROWSER_USER_AGENT})
         with urlopen(request, timeout=10) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            return html.unescape(response.read().decode(charset, errors="replace"))
+            page = response.read().decode(charset, errors="replace")
+            if page:
+                return html.unescape(page)
     except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        pass
+    return fetch_html_with_curl(page_url)
+
+
+def fetch_html_with_curl(page_url: str) -> str:
+    """Fallback for sites/environments where urllib cannot resolve or fetch."""
+    if not shutil.which("curl"):
         return ""
+    command = [
+        "curl",
+        "-fsSL",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "15",
+        "-A",
+        BROWSER_USER_AGENT,
+        page_url,
+    ]
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+            if result.stdout:
+                return html.unescape(result.stdout)
+        except (OSError, subprocess.CalledProcessError):
+            if attempt < 2:
+                time.sleep(0.4)
+    return ""
+
+
+def discover_json_ld_video_sources(blocks: list[str], page_url: str) -> list[tuple[str, str]]:
+    videos: list[tuple[str, str]] = []
+    for block in blocks:
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        collect_json_ld_video_sources(data, page_url, videos)
+    return videos
+
+
+def collect_json_ld_video_sources(data, page_url: str, videos: list[tuple[str, str]]) -> None:
+    if isinstance(data, list):
+        for item in data:
+            collect_json_ld_video_sources(item, page_url, videos)
+        return
+
+    if not isinstance(data, dict):
+        return
+
+    item_type = data.get("@type")
+    types = item_type if isinstance(item_type, list) else [item_type]
+    is_video = any(str(value).lower() == "videoobject" for value in types if value is not None)
+    if is_video:
+        title = str(data.get("name") or data.get("headline") or "Structured video")
+        for key in ("contentUrl", "embedUrl", "url"):
+            value = data.get(key)
+            if isinstance(value, list):
+                for nested in value:
+                    add_structured_video_source(videos, page_url, nested, title, key)
+            else:
+                add_structured_video_source(videos, page_url, value, title, key)
+
+    for value in data.values():
+        if isinstance(value, (dict, list)):
+            collect_json_ld_video_sources(value, page_url, videos)
+
+
+def add_structured_video_source(
+    videos: list[tuple[str, str]],
+    page_url: str,
+    raw_url,
+    title: str,
+    key: str,
+) -> None:
+    if not isinstance(raw_url, str):
+        return
+    try:
+        media_url = urljoin(page_url, html.unescape(raw_url.strip()))
+    except ValueError:
+        return
+    if looks_like_direct_media_url(media_url):
+        videos.append((f"{title} ({key})", media_url))
+
+
+def discover_html_media_sources(page: str, page_url: str) -> list[tuple[str, str]]:
+    parser = HTMLMediaSourceParser(page_url)
+    try:
+        parser.feed(page)
+    except Exception:
+        return []
+    return dedupe_videos([
+        *parser.sources,
+        *discover_json_ld_video_sources(parser.json_ld_blocks, page_url),
+    ])
 
 
 def discover_embedded_urls(page: str) -> list[str]:
@@ -424,12 +883,24 @@ def make_html_link(url: str, text: str | None = None) -> str:
     return f'<a href="{escaped_href}">{escaped_text}</a>'
 
 
-def parse_args(argv: list[str]):
-    url = None
-    cookies_browser = None
-    want_html = False
-    sweep = False
-    seed = None
+class Args:
+    def __init__(self):
+        self.url = None
+        self.cookies_browser = None
+        self.want_html = False
+        self.want_subtitle_prompt = False
+        self.want_subtitle_auto = False
+        self.sweep = False
+        self.seed = None
+        self.subtitles = None
+        self.no_subtitle_prompt = False
+        self.subtitle_language = "auto"
+        self.subtitle_model = "small"
+        self.subtitle_service_url = SUBTITLE_SERVICE_URL
+
+
+def parse_args(argv: list[str]) -> Args:
+    args = Args()
     # --cookies-from-browser matches yt-dlp; --cookies-from is a kept alias.
     cookie_flags = {"--cookies-from-browser", "--cookies-from"}
 
@@ -440,9 +911,9 @@ def parse_args(argv: list[str]):
 
         if flag in cookie_flags:
             if inline_value:                        # --cookies-from-browser=chrome
-                cookies_browser = inline_value
+                args.cookies_browser = inline_value
             elif i + 1 < len(argv):                 # --cookies-from-browser chrome
-                cookies_browser = argv[i + 1]
+                args.cookies_browser = argv[i + 1]
                 i += 2
                 continue
             else:
@@ -456,27 +927,62 @@ def parse_args(argv: list[str]):
                 if not raw_seed.lstrip("-").isdigit():
                     print("error: --seed needs an integer", file=sys.stderr)
                     sys.exit(2)
-                seed = int(raw_seed)
+                args.seed = int(raw_seed)
                 continue
             if not raw_seed.lstrip("-").isdigit():
                 print("error: --seed needs an integer", file=sys.stderr)
                 sys.exit(2)
-            seed = int(raw_seed)
+            args.seed = int(raw_seed)
+        elif flag == "--subtitles":
+            if inline_value:
+                args.subtitles = inline_value
+            elif i + 1 < len(argv):
+                args.subtitles = argv[i + 1]
+                i += 2
+                continue
+        elif flag == "--subtitle-language":
+            if inline_value:
+                args.subtitle_language = inline_value
+            elif i + 1 < len(argv):
+                args.subtitle_language = argv[i + 1]
+                i += 2
+                continue
+        elif flag == "--subtitle-model":
+            if inline_value:
+                args.subtitle_model = inline_value
+            elif i + 1 < len(argv):
+                args.subtitle_model = argv[i + 1]
+                i += 2
+                continue
+        elif flag == "--subtitle-service-url":
+            if inline_value:
+                args.subtitle_service_url = inline_value
+            elif i + 1 < len(argv):
+                args.subtitle_service_url = argv[i + 1]
+                i += 2
+                continue
+        elif arg == "--no-subtitle-prompt":
+            args.no_subtitle_prompt = True
         elif arg == "--sweep-test":
-            sweep = True
+            args.sweep = True
         elif arg == "--html":
-            want_html = True
+            args.want_html = True
+        elif arg == "--subtitle-prompt":
+            args.want_subtitle_prompt = True
+        elif arg == "--subtitle-auto":
+            args.want_subtitle_auto = True
         elif arg in {"-h", "--help"}:
             print(__doc__)
             sys.exit(0)
-        elif not arg.startswith("-") and url is None:
-            url = arg
+        elif not arg.startswith("-") and args.url is None:
+            args.url = arg
         i += 1
 
-    if cookies_browser is not None:
-        cookies_browser = validate_browser(cookies_browser)
+    if args.cookies_browser is not None:
+        args.cookies_browser = validate_browser(args.cookies_browser)
+    args.subtitle_service_url = (args.subtitle_service_url or SUBTITLE_SERVICE_URL).rstrip("/")
 
-    return url, cookies_browser, want_html, sweep, seed
+    return args
 
 
 def validate_browser(name: str) -> str:
@@ -581,27 +1087,161 @@ def print_sweep_summary(results: list[dict], seed: int) -> None:
         print(f"    {r['elapsed']:>5}s  {short(r['url'], 40):<40} {tag}")
 
 
-def main() -> None:
-    raw_url, cookies_browser, want_html, sweep, seed = parse_args(sys.argv[1:])
+def resolve_subtitle_mode(args, title: str) -> str | None:
+    if args.subtitles:
+        return args.subtitles
+    if args.no_subtitle_prompt:
+        return "none"
+    if args.want_subtitle_auto:
+        return "live"
+    if not args.want_subtitle_prompt:
+        return "none"
 
-    if sweep:
-        run_sweep(seed)
+    prompt = "How would you like subtitles?"
+    if shutil.which("osascript"):
+        script = (
+            f'set chosen to choose from list {{"No subtitles", "Live subtitles", "Compile subtitles first"}} '
+            f'with prompt {applescript_string(prompt)} '
+            f'with title "Video Subtitles" '
+            f'without multiple selections allowed\\n'
+            'if chosen is false then return "Cancel"\\n'
+            'return item 1 of chosen'
+        )
+        try:
+            result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=True)
+            choice = result.stdout.strip("\\n")
+            if choice == "No subtitles": return "none"
+            if choice == "Live subtitles": return "live"
+            if choice == "Compile subtitles first": return "compile"
+            if choice == "Cancel": return None
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    if sys.stdin.isatty():
+        choice = choose_in_terminal(["No subtitles", "Live subtitles", "Compile subtitles first"], prompt)
+        if choice == 0: return "none"
+        if choice == 1: return "live"
+        if choice == 2: return "compile"
+        return None
+
+    return "none"
+
+
+def create_live_subtitle_session(media_url: str, title: str, language: str, model: str) -> tuple[dict | None, str | None]:
+    # Generate the IPC socket path here (in /tmp - see make_iina_ipc_path)
+    # rather than letting the server default one from its own environment.
+    # The server's own tempfile.gettempdir() fallback is fine as long as the
+    # server process itself isn't sandboxed, but supplying our own keeps the
+    # guarantee explicit regardless of how/where the service happens to run.
+    payload = json.dumps({
+        "media_url": media_url,
+        "title": title,
+        "language": language,
+        "model": model,
+        "mode": "live",
+        "iina_ipc_path": make_iina_ipc_path(),
+    }).encode("utf-8")
+    request = Request(
+        f"{SUBTITLE_SERVICE_URL}/sessions",
+        data=payload,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except HTTPError as error:
+        try:
+            body = json.loads(error.read().decode("utf-8"))
+            detail = body.get("detail") or error.reason
+        except (OSError, ValueError):
+            detail = error.reason
+        return None, str(detail)
+    except (URLError, TimeoutError, OSError, ValueError) as error:
+        return None, str(error)
+
+
+def start_live_subtitle_session(session_id: str) -> tuple[bool, str | None]:
+    request = Request(
+        f"{SUBTITLE_SERVICE_URL}/sessions/{session_id}/start",
+        data=b"",
+        headers={"Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=5) as response:
+            response.read()
+            return True, None
+    except HTTPError as error:
+        try:
+            body = json.loads(error.read().decode("utf-8"))
+            detail = body.get("detail") or error.reason
+        except (OSError, ValueError):
+            detail = error.reason
+        return False, str(detail)
+    except (URLError, TimeoutError, OSError, ValueError) as error:
+        return False, str(error)
+
+
+def stop_subtitle_session(session_id: str) -> None:
+    request = Request(
+        f"{SUBTITLE_SERVICE_URL}/sessions/{session_id}/stop",
+        data=b"",
+        headers={"Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=5) as response:
+            pass
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        pass
+
+
+def ask_open_without_subtitles(error: str) -> bool:
+    prompt = f"Subtitle service failed: {error}\\nOpen video without subtitles?"
+    if shutil.which("osascript"):
+        script = (
+            f'display dialog {applescript_string(prompt)} '
+            'buttons {"Cancel", "Open"} default button "Open" cancel button "Cancel" '
+            f'with title "Video Subtitles"\\n'
+            'return button returned of result'
+        )
+        try:
+            result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=True)
+            return result.stdout.strip() == "Open"
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    if sys.stdin.isatty():
+        choice = input(f"{prompt} [Y/n] ").strip().lower()
+        return choice in {"y", "yes", ""}
+    return False
+
+
+def main() -> None:
+    args = parse_args(sys.argv[1:])
+    global SUBTITLE_SERVICE_URL
+    SUBTITLE_SERVICE_URL = args.subtitle_service_url
+
+    if args.sweep:
+        run_sweep(args.seed)
         return
 
-    if not raw_url:
-        raw_url = read_clipboard().strip()
+    if not args.url:
+        args.url = read_clipboard().strip()
 
-    page_url = normalize_page_url(raw_url)
+    page_url = normalize_page_url(args.url)
     if not looks_like_url(page_url):
-        # Only prompt when there's a real terminal — under a hotkey there's no
-        # TTY and input() would raise EOFError with no notification.
         if sys.stdin.isatty():
             page_url = normalize_page_url(input("Enter website URL: "))
         if not looks_like_url(page_url):
             notify("Clipboard doesn't contain a URL.")
             sys.exit(1)
 
-    videos, _source, error = extract_with_timeout(page_url, cookies_browser)
+    videos, _source, error = extract_with_timeout(page_url, args.cookies_browser)
 
     if not videos:
         if isinstance(error, TimeoutError):
@@ -620,14 +1260,58 @@ def main() -> None:
             return
         title, chosen = videos[index]
 
-    payload = make_html_link(chosen, title) if want_html else chosen
-    label = "HTML link" if want_html else "link"
+    payload = make_html_link(chosen, title) if args.want_html else chosen
+    label = "HTML link" if args.want_html else "link"
 
-    if copy_to_clipboard(payload):
-        notify(f"Copied {label}: {short(chosen)}")
+    copied = copy_to_clipboard(payload)
+
+    subtitle_mode = resolve_subtitle_mode(args, title)
+    if subtitle_mode is None:
+        notify("Cancelled — video was not opened.")
+        return
+
+    opened = False
+    if subtitle_mode == "none":
+        opened = open_in_iina(chosen)
+    elif subtitle_mode == "live":
+        direct_url = resolve_direct_media_url_with_timeout(chosen, args.cookies_browser) or chosen
+        session, session_error = create_live_subtitle_session(
+            media_url=direct_url,
+            title=title,
+            language=args.subtitle_language,
+            model=args.subtitle_model
+        )
+        if session is None:
+            if ask_open_without_subtitles(session_error or "Unknown error"):
+                opened = open_in_iina(chosen)
+            else:
+                return
+        else:
+            opened = open_in_iina(direct_url, ipc_path=session['ipc_socket_path'])
+            if opened:
+                started, start_error = start_live_subtitle_session(session['id'])
+                if not started:
+                    stop_subtitle_session(session['id'])
+                    notify(
+                        "Opened in IINA, but couldn't start live subtitles: "
+                        f"{start_error or 'Unknown error'}"
+                    )
+                    return
+            else:
+                stop_subtitle_session(session['id'])
+    elif subtitle_mode == "compile":
+        opened = open_in_iina(chosen)
+
+    if copied and opened:
+        notify(f"Copied {label} and opened in IINA: {short(chosen)}")
+    elif copied:
+        notify(f"Copied {label}, but couldn't open IINA: {short(chosen)}")
+    elif opened:
+        print(payload)
+        notify(f"Opened in IINA, but couldn't reach the clipboard — printed {label}.")
     else:
         print(payload)
-        notify(f"Couldn't reach the clipboard — printed {label} to terminal.")
+        notify(f"Couldn't reach the clipboard or IINA — printed {label} to terminal.")
 
 
 if __name__ == "__main__":
