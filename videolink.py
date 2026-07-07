@@ -111,6 +111,11 @@ KALTURA_PARTNER = re.compile(
 KALTURA_ENTRY = re.compile(
     r"(?:entry_?id[\"']?\s*[:=]\s*[\"']?|/entry_id/)([01]_[0-9a-zA-Z]{8})", re.I
 )
+GUARDIAN_INTERACTIVE_APP_URL = re.compile(
+    r"(?:https?:)?//interactive\.guim\.co\.uk/atoms/[^\"'<>\s]+/app\.js", re.I
+)
+GUARDIAN_SHEET_ID = re.compile(r"sheetId\s*:\s*[\"']([A-Za-z0-9_-]+)[\"']")
+GUARDIAN_DOCU_ID = re.compile(r"\bdata-docu-id\s*=\s*[\"']([^\"']+)[\"']", re.I)
 # yt-dlp can read cookies from these browsers. We validate against this list so a
 # typo fails loudly instead of silently extracting without authentication.
 SUPPORTED_BROWSERS = (
@@ -518,6 +523,10 @@ def extract_videos_traced(
         if direct_videos:
             return direct_videos, "fallback"
 
+        guardian_videos = discover_guardian_interactive_videos(page, page_url, deadline)
+        if guardian_videos:
+            return guardian_videos, "fallback"
+
     if not deadline.expired:
         videos = ydl_extract(page_url, cookies_browser, deadline)
         if videos:
@@ -858,12 +867,8 @@ def kaltura_url(partner_id: str, entry_id: str) -> str:
 
 # --- page fetch + embed discovery --------------------------------------------
 
-def fetch_html(page_url: str, deadline: Deadline | None = None) -> str:
-    """Fetch a page ONCE for the fallback. Returns "" (not an error) on failure.
-
-    The fetch is capped to a short slice of the shared deadline so candidate
-    probing and the generic last resort still have budget afterwards.
-    """
+def fetch_text(page_url: str, deadline: Deadline | None = None) -> str:
+    """Fetch text once. Returns "" (not an error) on failure."""
     timeout = deadline.remaining(cap=FETCH_BUDGET_CAP_SECONDS) if deadline else 10
     if timeout <= DEADLINE_FLOOR_SECONDS:
         return ""
@@ -871,21 +876,24 @@ def fetch_html(page_url: str, deadline: Deadline | None = None) -> str:
         request = Request(page_url, headers={"User-Agent": BROWSER_USER_AGENT})
         with urlopen(request, timeout=timeout) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            page = response.read().decode(charset, errors="replace")
-            if page:
-                return html.unescape(page)
+            return response.read().decode(charset, errors="replace")
     except (HTTPError, URLError, TimeoutError, OSError, ValueError):
         pass
-    return fetch_html_with_curl(page_url, deadline)
+    return fetch_text_with_curl(page_url, deadline)
 
 
-def fetch_html_with_curl(page_url: str, deadline: Deadline | None = None) -> str:
-    """Fallback for sites/environments where urllib cannot resolve or fetch.
+def fetch_html(page_url: str, deadline: Deadline | None = None) -> str:
+    """Fetch a page ONCE for the fallback. Returns "" (not an error) on failure.
 
-    Single attempt, bounded by the remaining shared budget — no retry loop can
-    overrun the hotkey budget. Makes NO subprocess call once the deadline has
-    effectively expired.
+    The fetch is capped to a short slice of the shared deadline so candidate
+    probing and the generic last resort still have budget afterwards.
     """
+    page = fetch_text(page_url, deadline)
+    return html.unescape(page) if page else ""
+
+
+def fetch_text_with_curl(page_url: str, deadline: Deadline | None = None) -> str:
+    """Raw curl fetch used for JSON/JS resources that must not be HTML-unescaped."""
     timeout = deadline.remaining(cap=FETCH_BUDGET_CAP_SECONDS) if deadline else 15
     if timeout <= DEADLINE_FLOOR_SECONDS:
         return ""
@@ -909,11 +917,21 @@ def fetch_html_with_curl(page_url: str, deadline: Deadline | None = None) -> str
             check=True,
             text=True,
         )
-        if result.stdout:
-            return html.unescape(result.stdout)
+        return result.stdout or ""
     except (OSError, subprocess.CalledProcessError):
         pass
     return ""
+
+
+def fetch_html_with_curl(page_url: str, deadline: Deadline | None = None) -> str:
+    """Fallback for sites/environments where urllib cannot resolve or fetch.
+
+    Single attempt, bounded by the remaining shared budget — no retry loop can
+    overrun the hotkey budget. Makes NO subprocess call once the deadline has
+    effectively expired.
+    """
+    page = fetch_text_with_curl(page_url, deadline)
+    return html.unescape(page) if page else ""
 
 
 def discover_json_ld_video_sources(blocks: list[str], page_url: str) -> list[tuple[str, str]]:
@@ -981,6 +999,97 @@ def discover_html_media_sources(page: str, page_url: str) -> list[tuple[str, str
         *parser.sources,
         *discover_json_ld_video_sources(parser.json_ld_blocks, page_url),
     ])
+
+
+def discover_guardian_interactive_videos(
+    page: str,
+    page_url: str,
+    deadline: Deadline,
+) -> list[tuple[str, str]]:
+    """Guardian documentary interactives store the playable YouTube id in docsdata."""
+    document_id = guardian_documentary_id(page)
+    app_urls = guardian_interactive_app_urls(page)
+    if not document_id or not app_urls:
+        return []
+
+    for app_url in app_urls:
+        if deadline.expired:
+            return []
+        script = fetch_text(app_url, deadline)
+        sheet_id = guardian_sheet_id(script)
+        if not sheet_id:
+            continue
+
+        if deadline.expired:
+            return []
+        data_url = f"https://interactive.guim.co.uk/docsdata/{sheet_id}.json"
+        videos = guardian_docsdata_videos(fetch_text(data_url, deadline), page_url, document_id)
+        if videos:
+            return videos
+    return []
+
+
+def guardian_documentary_id(page: str) -> str | None:
+    for tag in re.findall(r"<[^>]+>", page):
+        if "docu-root" not in tag.lower():
+            continue
+        match = GUARDIAN_DOCU_ID.search(tag)
+        if match:
+            return html.unescape(match.group(1)).strip()
+    return None
+
+
+def guardian_interactive_app_urls(page: str) -> list[str]:
+    urls: list[str] = []
+    for raw_url in GUARDIAN_INTERACTIVE_APP_URL.findall(page):
+        url = "https:" + raw_url if raw_url.startswith("//") else raw_url
+        urls.append(url)
+    return dedupe_preserve(urls)[:3]
+
+
+def guardian_sheet_id(script: str) -> str | None:
+    match = GUARDIAN_SHEET_ID.search(script)
+    return match.group(1) if match else None
+
+
+def guardian_docsdata_videos(
+    raw_json: str,
+    page_url: str,
+    document_id: str,
+) -> list[tuple[str, str]]:
+    if not raw_json:
+        return []
+    try:
+        payload = json.loads(raw_json)
+    except ValueError:
+        return []
+
+    rows = payload.get("sheets", {}).get("documentaries", [])
+    if not isinstance(rows, list):
+        return []
+
+    page_key = guardian_link_key(page_url)
+    for row in rows:
+        if not isinstance(row, dict) or not guardian_docsdata_row_matches(row, page_key, document_id):
+            continue
+        video_id = str(row.get("youTubeId") or "").strip()
+        if not re.fullmatch(_YT_ID, video_id):
+            continue
+        title = str(row.get("title") or "Guardian documentary").strip()
+        return [(title, youtube_watch_url(video_id))]
+    return []
+
+
+def guardian_link_key(url: str) -> str:
+    """Normalize a Guardian URL for docsdata matching: drop query/fragment
+    (share links carry ?CMP=... trackers) and any trailing slash."""
+    return url.strip().split("#", 1)[0].split("?", 1)[0].rstrip("/")
+
+
+def guardian_docsdata_row_matches(row: dict, page_key: str, document_id: str) -> bool:
+    if str(row.get("docName") or "").strip() == document_id:
+        return True
+    return guardian_link_key(str(row.get("fullLink") or "")) == page_key
 
 
 def discover_embedded_urls(page: str) -> list[str]:

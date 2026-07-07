@@ -236,6 +236,20 @@ class ResolverRedesignTests(unittest.TestCase):
                 f"{url} (extractor {name!r}) must not fast-path",
             )
 
+    def test_guardian_docsdata_row_matches_share_links_with_trackers(self) -> None:
+        """?CMP=... share links and #fragments must still match the fullLink row."""
+        row = {"fullLink": "https://www.theguardian.com/x/ng-interactive/doc/", "youTubeId": ""}
+        for url in (
+            "https://www.theguardian.com/x/ng-interactive/doc?CMP=share_btn_link",
+            "https://www.theguardian.com/x/ng-interactive/doc/#top",
+            "https://www.theguardian.com/x/ng-interactive/doc",
+        ):
+            self.assertTrue(
+                videolink.guardian_docsdata_row_matches(
+                    row, videolink.guardian_link_key(url), "other-doc"),
+                url,
+            )
+
     def test_deadline_timeouts_are_fractional_and_floor_out(self) -> None:
         # Nearly-expired budget: ydl_extract must not even construct a YoutubeDL.
         with mock.patch.object(
@@ -288,6 +302,50 @@ class ResolverRedesignTests(unittest.TestCase):
         self.assertEqual(source, "fallback")
         self.assertEqual(videos[0], ("Real embed", embed_url))
         self.assertNotIn("preview-lowres.mp4", videos[0][1])
+
+    def test_guardian_interactive_documentary_resolves_to_youtube(self) -> None:
+        url = (
+            "https://www.theguardian.com/global/ng-interactive/2026/jun/09/"
+            "how-do-you-give-britains-hidden-army-a-break-is-mum-ok-documentary"
+        )
+        page = """
+        <div id="docu-root" data-docu-id="is-mum-ok?"></div>
+        <script>
+        el.src = "https://interactive.guim.co.uk/atoms/2026/05/documentary-interactive/documentary-too-young-to-care/v/1780499670/app.js";
+        </script>
+        """
+        app_js = 'var s={sheetId:"1jYb4okCk7I42wCoduH-o48DE-EKGajM8w-MTxQYxmck"};'
+        docsdata = json.dumps({
+            "sheets": {
+                "documentaries": [
+                    {
+                        "docName": "is-mum-ok?",
+                        "title": "Is Mum OK?",
+                        "youTubeId": "ljMQCsaPukE",
+                        "fullLink": url,
+                    }
+                ]
+            }
+        })
+
+        def fake_fetch_text(target, deadline=None):
+            if target == url:
+                return page
+            if target.endswith("/app.js"):
+                return app_js
+            if target.endswith("/1jYb4okCk7I42wCoduH-o48DE-EKGajM8w-MTxQYxmck.json"):
+                return docsdata
+            return ""
+
+        with (
+            mock.patch.object(videolink, "fetch_text", side_effect=fake_fetch_text),
+            mock.patch.object(videolink, "ydl_extract",
+                              side_effect=AssertionError("generic extraction must not be needed")),
+        ):
+            videos, source = videolink.extract_videos_traced(url, None)
+
+        self.assertEqual(source, "fallback")
+        self.assertEqual(videos, [("Is Mum OK?", "https://www.youtube.com/watch?v=ljMQCsaPukE")])
 
     def test_concurrent_probe_race_returns_before_slow_candidate(self) -> None:
         def fake_ydl(url, cookies, deadline=None):
