@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import json
 import subprocess
+import time
 import unittest
 from unittest import mock
 
@@ -156,6 +157,207 @@ class VideoLinkCoreTests(unittest.TestCase):
         request, timeout = requests[0]
         self.assertEqual(timeout, 5)
         self.assertEqual(request.full_url, "http://127.0.0.1:8765/sessions/session-1/start")
+
+
+class ResolverRedesignTests(unittest.TestCase):
+    """Regressions for the fast path, deadline budget, ordering, and dialogs."""
+
+    def setUp(self) -> None:
+        if videolink is None:
+            self.skipTest(f"videolink dependencies unavailable: {VIDEOLINK_IMPORT_ERROR}")
+
+    def test_fast_path_platform_url_skips_fetch_and_extraction(self) -> None:
+        """A YouTube-like URL returns immediately: no HTML fetch, no yt-dlp run."""
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        with (
+            mock.patch.object(videolink, "fetch_html",
+                              side_effect=AssertionError("fetch_html must not be called")),
+            mock.patch.object(videolink, "ydl_extract",
+                              side_effect=AssertionError("ydl_extract must not be called")),
+        ):
+            videos, source = videolink.extract_videos_traced(url, None)
+
+        self.assertEqual(source, "fast-path")
+        self.assertEqual(videos, [(url, url)])
+
+    def test_fast_path_direct_media_url(self) -> None:
+        url = "https://vcdn02.spiegel.de/videos/Wa1zjie2-b8Tmknhy.mp4"
+        with (
+            mock.patch.object(videolink, "fetch_html",
+                              side_effect=AssertionError("fetch_html must not be called")),
+            mock.patch.object(videolink, "ydl_extract",
+                              side_effect=AssertionError("ydl_extract must not be called")),
+        ):
+            videos, source = videolink.extract_videos_traced(url, None)
+
+        self.assertEqual(source, "fast-path")
+        self.assertEqual(videos, [(url, url)])
+
+    def test_fast_path_denylists_bild_so_delivery_preference_runs(self) -> None:
+        """BILD article URLs must NOT fast-path: the fragile-host swap to
+        durable hds.ak.token.bild.de delivery manifests has to run."""
+        url = "https://www.bild.de/video/clip/news/test-video-12345678.bild.html"
+
+        name = videolink.specific_extractor_name(url)
+        self.assertIsNotNone(name, "yt-dlp registry no longer claims BILD URLs?")
+        self.assertIn("bild", name.lower())
+        self.assertIsNone(videolink.fast_path_videos(url))
+
+        page = '"https:\\/\\/hds.ak.token.bild.de\\/video\\/master.m3u8,delivery=hls"'
+
+        def fake_ydl(target, cookies, deadline=None):
+            if target == url:  # generic last resort resolves a fragile CDN URL
+                return [("Clip", "https://bild.cdn.content-discovery.video/hls/clip.m3u8")]
+            return []
+
+        with (
+            mock.patch.object(videolink, "fetch_html", return_value=page),
+            mock.patch.object(videolink, "ydl_extract", side_effect=fake_ydl),
+        ):
+            videos, source = videolink.extract_videos_traced(url, None)
+
+        self.assertEqual(source, "fallback")
+        self.assertEqual(videos, [
+            ("BILD delivery HLS",
+             "https://hds.ak.token.bild.de/video/master.m3u8,delivery=hls"),
+        ])
+
+    def test_fast_path_excludes_collection_extractors(self) -> None:
+        """Set/album/showcase pages keep the multi-video picker flow."""
+        for url in (
+            "https://soundcloud.com/some-artist/sets/some-set",
+            "https://someartist.bandcamp.com/album/some-album",
+            "https://vimeo.com/album/1234567",
+        ):
+            name = videolink.specific_extractor_name(url)
+            self.assertIsNotNone(name, f"registry no longer claims {url}")
+            self.assertIsNone(
+                videolink.fast_path_videos(url),
+                f"{url} (extractor {name!r}) must not fast-path",
+            )
+
+    def test_deadline_timeouts_are_fractional_and_floor_out(self) -> None:
+        # Nearly-expired budget: ydl_extract must not even construct a YoutubeDL.
+        with mock.patch.object(
+            videolink.yt_dlp, "YoutubeDL",
+            side_effect=AssertionError("YoutubeDL must not be constructed"),
+        ):
+            self.assertEqual(
+                videolink.ydl_extract("https://example.com/x", None, videolink.Deadline(0.2)),
+                [],
+            )
+
+        # Fractional remaining time is passed through to curl, not rounded up.
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="<html></html>", stderr="")
+
+        with (
+            mock.patch.object(videolink.shutil, "which", return_value="/usr/bin/curl"),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+        ):
+            videolink.fetch_html_with_curl("https://example.com/x", videolink.Deadline(2.5))
+
+        command = commands[0]
+        max_time = float(command[command.index("--max-time") + 1])
+        self.assertLessEqual(max_time, 2.5)
+        self.assertGreater(max_time, 1.0, "must not be floored/rounded to whole seconds")
+
+    def test_iframe_candidate_outranks_og_video_preview(self) -> None:
+        """A real embedded player must win over an og:video preview file."""
+        page = """
+        <meta property="og:video" content="https://cdn.example.com/preview-lowres.mp4">
+        <iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>
+        """
+        embed_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+        def fake_ydl(url, cookies, deadline=None):
+            if "youtube" in url:
+                return [("Real embed", embed_url)]
+            return []
+
+        with (
+            mock.patch.object(videolink, "fetch_html", return_value=page),
+            mock.patch.object(videolink, "ydl_extract", side_effect=fake_ydl),
+        ):
+            videos, source = videolink.extract_videos_traced(
+                "https://news.example.com/story", None)
+
+        self.assertEqual(source, "fallback")
+        self.assertEqual(videos[0], ("Real embed", embed_url))
+        self.assertNotIn("preview-lowres.mp4", videos[0][1])
+
+    def test_concurrent_probe_race_returns_before_slow_candidate(self) -> None:
+        def fake_ydl(url, cookies, deadline=None):
+            if url.startswith("https://slow"):
+                time.sleep(3)
+                return []
+            return [("Fast", url)]
+
+        start = time.monotonic()
+        with mock.patch.object(videolink, "ydl_extract", side_effect=fake_ydl):
+            videos = videolink.probe_candidates_concurrently(
+                ["https://slow.example.com/embed", "https://fast.example.com/embed"],
+                None,
+                videolink.Deadline(10),
+            )
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(videos, [("Fast", "https://fast.example.com/embed")])
+        self.assertLess(elapsed, 2.0, "probe race must not wait for the slow candidate")
+
+    def test_deadline_expired_curl_makes_no_subprocess_call(self) -> None:
+        calls: list = []
+        with (
+            mock.patch.object(videolink.shutil, "which", return_value="/usr/bin/curl"),
+            mock.patch.object(videolink.subprocess, "run",
+                              side_effect=lambda *a, **k: calls.append(a)),
+        ):
+            page = videolink.fetch_html_with_curl("https://example.com", videolink.Deadline(0))
+
+        self.assertEqual(page, "")
+        self.assertEqual(calls, [])
+
+    def test_subtitle_mode_applescript_uses_real_newlines(self) -> None:
+        scripts: list[str] = []
+
+        def fake_run(command, **kwargs):
+            scripts.append(command[2])
+            return subprocess.CompletedProcess(command, 0, stdout="Live subtitles\n", stderr="")
+
+        args = videolink.parse_args(["--subtitle-prompt"])
+        with (
+            mock.patch.object(videolink.shutil, "which", return_value="/usr/bin/osascript"),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+        ):
+            mode = videolink.resolve_subtitle_mode(args, "Title")
+
+        self.assertEqual(mode, "live")
+        script = scripts[0]
+        self.assertNotIn("\\n", script, "literal backslash-n is an AppleScript syntax error")
+        self.assertIn('\nif chosen is false then return "Cancel"\n', script)
+
+    def test_open_without_subtitles_dialog_uses_real_newlines(self) -> None:
+        scripts: list[str] = []
+
+        def fake_run(command, **kwargs):
+            scripts.append(command[2])
+            return subprocess.CompletedProcess(command, 0, stdout="Open\n", stderr="")
+
+        with (
+            mock.patch.object(videolink.shutil, "which", return_value="/usr/bin/osascript"),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+        ):
+            answer = videolink.ask_open_without_subtitles("service down")
+
+        self.assertTrue(answer)
+        script = scripts[0]
+        # Statements separated by REAL newlines...
+        self.assertIn('with title "Video Subtitles"\nreturn button returned of result', script)
+        # ...while the newline inside the prompt string uses AppleScript's \n escape.
+        self.assertIn("\\nOpen video without subtitles?", script)
 
 
 class SubtitleServiceStatusTests(unittest.TestCase):

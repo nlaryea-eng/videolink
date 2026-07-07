@@ -111,7 +111,6 @@ KALTURA_PARTNER = re.compile(
 KALTURA_ENTRY = re.compile(
     r"(?:entry_?id[\"']?\s*[:=]\s*[\"']?|/entry_id/)([01]_[0-9a-zA-Z]{8})", re.I
 )
-
 # yt-dlp can read cookies from these browsers. We validate against this list so a
 # typo fails loudly instead of silently extracting without authentication.
 SUPPORTED_BROWSERS = (
@@ -121,6 +120,25 @@ SUPPORTED_BROWSERS = (
 # A web page that pulls in lots of requests can take a long time. A keybind
 # tool must never hang, so we abandon extraction after this many seconds.
 EXTRACT_TIMEOUT_SECONDS = 12
+
+# One HTML fetch may only consume a short slice of the overall budget, so the
+# candidate probes and the generic last resort still have time to run.
+FETCH_BUDGET_CAP_SECONDS = 6
+# Embedded-player candidates probed at once; first usable result wins.
+PROBE_CANDIDATE_LIMIT = 8
+PROBE_WORKER_CAP = 4
+# Extractors that claim playlist/channel/search/collection pages. Those still
+# go through the normal flow so the multi-video picker keeps working.
+FAST_PATH_EXCLUDED_MARKERS = (
+    "playlist", "tab", "channel", "user", "search", "feed", "album", ":set",
+)
+# Extractors whose page flow must always run even for a single video, because
+# their resolved media needs post-processing (e.g. BILD's fragile CDN URLs are
+# swapped for durable hds.ak.token.bild.de delivery manifests).
+FAST_PATH_DENYLISTED_EXTRACTORS = {"bild"}
+# Below this remaining budget a stage is treated as expired instead of being
+# rounded up to a whole-second timeout that could overrun the global budget.
+DEADLINE_FLOOR_SECONDS = 0.25
 SUBTITLE_SERVICE_URL = os.environ.get(
     "VIDEOLINK_SUBTITLE_SERVICE",
     "http://127.0.0.1:8765",
@@ -329,8 +347,12 @@ def choose_in_terminal(labels: list[str], prompt: str) -> int | None:
 
 
 def applescript_string(value: str) -> str:
-    """Quote a Python string as an AppleScript string literal."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    """Quote a Python string as an AppleScript string literal.
+
+    Real newlines in the value become AppleScript's "\\n" escape — a raw line
+    break inside an AppleScript string literal is a syntax error.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return f'"{escaped}"'
 
 
@@ -351,6 +373,73 @@ def make_iina_ipc_path() -> str:
 
 
 # --- core --------------------------------------------------------------------
+
+class Deadline:
+    """One monotonic budget shared by every stage of a resolver run.
+
+    Every socket-level operation asks for `remaining(cap=...)` so no single
+    stage (fetch, probe, generic extraction) can overrun the hotkey budget.
+    """
+
+    def __init__(self, seconds: float):
+        self._end = time.monotonic() + seconds
+
+    def remaining(self, cap: float | None = None) -> float:
+        left = max(0.0, self._end - time.monotonic())
+        return min(left, cap) if cap is not None else left
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+
+# Built once per process; ~0.2s the first time, then effectively free.
+_SPECIFIC_EXTRACTORS: list | None = None
+
+
+def specific_extractor_name(url: str) -> str | None:
+    """Name of the non-generic yt-dlp extractor that claims this URL.
+
+    Purely offline: matches the URL against the installed extractor registry's
+    compiled patterns. No network traffic.
+    """
+    global _SPECIFIC_EXTRACTORS
+    if _SPECIFIC_EXTRACTORS is None:
+        from yt_dlp.extractor import gen_extractor_classes
+        _SPECIFIC_EXTRACTORS = [
+            ie for ie in gen_extractor_classes()
+            if ie.IE_NAME not in ("generic", "html5")
+        ]
+    for ie in _SPECIFIC_EXTRACTORS:
+        try:
+            if ie.suitable(url):
+                return ie.IE_NAME
+        except Exception:
+            continue
+    return None
+
+
+def fast_path_videos(page_url: str) -> list[tuple[str, str]] | None:
+    """Zero-network answer for URLs that already are the video link.
+
+    Direct media URLs (.m3u8/.mpd/.mp4/...) and URLs claimed by a specific
+    yt-dlp extractor are returned as-is: the durable original URL is what the
+    hotkey copies and what IINA opens, so resolving formats would only add
+    seconds of network work whose output gets discarded. Playlist-ish
+    extractor matches are excluded so the multi-video picker still works.
+    """
+    if looks_like_direct_media_url(page_url):
+        return [(page_url, page_url)]
+
+    name = specific_extractor_name(page_url)
+    if name:
+        lowered = name.lower()
+        if lowered in FAST_PATH_DENYLISTED_EXTRACTORS:
+            return None
+        if not any(marker in lowered for marker in FAST_PATH_EXCLUDED_MARKERS):
+            return [(page_url, page_url)]
+    return None
+
 
 def normalize_page_url(raw_url: str) -> str:
     page_url = raw_url.strip()
@@ -397,51 +486,143 @@ def extract_videos(page_url: str, cookies_browser: str | None) -> list[tuple[str
 
 
 def extract_videos_traced(
-    page_url: str, cookies_browser: str | None
+    page_url: str, cookies_browser: str | None, deadline: Deadline | None = None
 ) -> tuple[list[tuple[str, str]], str]:
-    """Return (videos, source) where source is 'primary', 'fallback', or 'none'.
+    """Return (videos, source): 'fast-path', 'primary', 'fallback', or 'none'.
 
-    1. Ask yt-dlp directly (primary).
-    2. If that finds nothing, fetch the page once and try, in order:
-         a. embedded YouTube/Vimeo ids, then
-         b. hosted players (Brightcove / JWPlayer / Kaltura),
-       resolving every discovered candidate *through* yt-dlp. The first stage that
-       yields a video wins. Candidates are deduped before probing and final
-       results are deduped after.
+    1. Fast path (zero network): direct media URLs and URLs claimed by a
+       specific yt-dlp extractor are returned as-is.
+    2. Otherwise fetch the page ONCE (deadline-capped) and probe real
+       embedded-player candidates (iframe/object/embed + canonical YouTube/
+       Vimeo ids + Brightcove/JWPlayer/Kaltura) concurrently through yt-dlp;
+       the first usable result wins.
+    3. Only after embedded players fail, fall back to direct HTML media,
+       JSON-LD, and Open Graph sources — so an og:video preview can never
+       outrank a real embed.
+    4. Generic yt-dlp extraction runs last, bounded by the remaining budget.
     """
-    videos = ydl_extract(page_url, cookies_browser)
-    page = ""
+    deadline = deadline or Deadline(EXTRACT_TIMEOUT_SECONDS)
 
-    if videos and has_fragile_resolved_media_url(videos):
-        page = fetch_html(page_url)
-        delivery_videos = discover_page_delivery_videos(page, page_url)
-        if delivery_videos:
-            return delivery_videos, "fallback"
+    fast = fast_path_videos(page_url)
+    if fast:
+        return fast, "fast-path"
 
-    if videos:
-        return videos, "primary"
-
-    page = page or fetch_html(page_url)
+    page = fetch_html(page_url, deadline)
     if page:
+        embed_candidates = discover_embed_candidate_urls(page, page_url)
+        videos = probe_candidates_concurrently(embed_candidates, cookies_browser, deadline)
+        if videos:
+            return videos, "fallback"
+
         direct_videos = discover_html_media_sources(page, page_url)
         if direct_videos:
             return direct_videos, "fallback"
 
-        for discover in (discover_embedded_urls, discover_player_urls):
-            found: list[tuple[str, str]] = []
-            for candidate_url in discover(page):
-                found.extend(ydl_extract(candidate_url, cookies_browser))
-            if found:
-                return dedupe_videos(found), "fallback"
+    if not deadline.expired:
+        videos = ydl_extract(page_url, cookies_browser, deadline)
+        if videos:
+            if has_fragile_resolved_media_url(videos) and page:
+                delivery_videos = discover_page_delivery_videos(page, page_url)
+                if delivery_videos:
+                    return delivery_videos, "fallback"
+            return videos, "primary"
 
     return [], "none"
 
 
-def ydl_extract(target_url: str, cookies_browser: str | None) -> list[tuple[str, str]]:
+EMBED_TAG_SRC = re.compile(
+    r"<(?:iframe|embed|object)\b[^>]*?\s(?:src|data)\s*=\s*[\"']([^\"']+)[\"']", re.I
+)
+
+
+def discover_embed_candidate_urls(page: str, page_url: str) -> list[str]:
+    """Embedded-player candidate URLs, best first.
+
+    iframe/object/embed sources are retained only when a specific (non-generic)
+    installed yt-dlp extractor recognizes them — matched offline, no network.
+    Canonical YouTube/Vimeo ids and reconstructed hosted-player URLs
+    (Brightcove/JWPlayer/Kaltura) are recognized by construction.
+    """
+    urls = list(discover_embedded_urls(page))
+
+    for match in EMBED_TAG_SRC.finditer(page):
+        try:
+            candidate = urljoin(page_url, html.unescape(match.group(1)).strip())
+        except ValueError:
+            continue
+        if candidate.startswith(("http://", "https://")) and specific_extractor_name(candidate):
+            urls.append(candidate)
+
+    urls.extend(discover_player_urls(page))
+    return dedupe_preserve(urls)[:PROBE_CANDIDATE_LIMIT]
+
+
+def probe_candidates_concurrently(
+    candidate_urls: list[str],
+    cookies_browser: str | None,
+    deadline: Deadline,
+    worker_cap: int = PROBE_WORKER_CAP,
+) -> list[tuple[str, str]]:
+    """Probe candidates through yt-dlp in parallel; first usable result wins.
+
+    Daemon threads (matching extract_with_timeout's pattern) gated by a small
+    semaphore. The waiter is released by the FIRST non-empty result — a slow
+    candidate cannot delay a fast one — or when all probes finish empty, or
+    when the deadline runs out. If several results raced in, the one from the
+    highest-ranked candidate is returned.
+    """
+    if not candidate_urls or deadline.expired:
+        return []
+
+    order = {url: index for index, url in enumerate(candidate_urls)}
+    results: dict[str, list[tuple[str, str]]] = {}
+    pending = set(candidate_urls)
+    lock = threading.Lock()
+    settled = threading.Event()
+    gate = threading.Semaphore(worker_cap)
+
+    def probe(url: str) -> None:
+        with gate:
+            if settled.is_set() or deadline.expired:
+                videos: list[tuple[str, str]] = []
+            else:
+                try:
+                    videos = ydl_extract(url, cookies_browser, deadline)
+                except Exception:
+                    videos = []
+        with lock:
+            pending.discard(url)
+            if videos:
+                results[url] = videos
+                settled.set()
+            elif not pending:
+                settled.set()
+
+    for url in candidate_urls:
+        threading.Thread(target=probe, args=(url,), daemon=True).start()
+
+    settled.wait(deadline.remaining())
+
+    with lock:
+        if not results:
+            return []
+        best = min(results, key=order.__getitem__)
+        return dedupe_videos(results[best])
+
+
+def ydl_extract(
+    target_url: str, cookies_browser: str | None, deadline: Deadline | None = None
+) -> list[tuple[str, str]]:
     """Resolve a single URL through yt-dlp. Returns [] if it finds nothing."""
     opts = dict(YDL_OPTS)
     if cookies_browser:
         opts["cookiesfrombrowser"] = (cookies_browser,)
+    if deadline is not None:
+        remaining = deadline.remaining(cap=10.0)
+        if remaining <= DEADLINE_FLOOR_SECONDS:
+            return []
+        # Fractional pass-through: rounding up to 1s could overrun the budget.
+        opts["socket_timeout"] = remaining
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -677,48 +858,61 @@ def kaltura_url(partner_id: str, entry_id: str) -> str:
 
 # --- page fetch + embed discovery --------------------------------------------
 
-def fetch_html(page_url: str) -> str:
-    """Fetch a page once for the fallback. Returns "" (not an error) on failure."""
+def fetch_html(page_url: str, deadline: Deadline | None = None) -> str:
+    """Fetch a page ONCE for the fallback. Returns "" (not an error) on failure.
+
+    The fetch is capped to a short slice of the shared deadline so candidate
+    probing and the generic last resort still have budget afterwards.
+    """
+    timeout = deadline.remaining(cap=FETCH_BUDGET_CAP_SECONDS) if deadline else 10
+    if timeout <= DEADLINE_FLOOR_SECONDS:
+        return ""
     try:
         request = Request(page_url, headers={"User-Agent": BROWSER_USER_AGENT})
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=timeout) as response:
             charset = response.headers.get_content_charset() or "utf-8"
             page = response.read().decode(charset, errors="replace")
             if page:
                 return html.unescape(page)
     except (HTTPError, URLError, TimeoutError, OSError, ValueError):
         pass
-    return fetch_html_with_curl(page_url)
+    return fetch_html_with_curl(page_url, deadline)
 
 
-def fetch_html_with_curl(page_url: str) -> str:
-    """Fallback for sites/environments where urllib cannot resolve or fetch."""
+def fetch_html_with_curl(page_url: str, deadline: Deadline | None = None) -> str:
+    """Fallback for sites/environments where urllib cannot resolve or fetch.
+
+    Single attempt, bounded by the remaining shared budget — no retry loop can
+    overrun the hotkey budget. Makes NO subprocess call once the deadline has
+    effectively expired.
+    """
+    timeout = deadline.remaining(cap=FETCH_BUDGET_CAP_SECONDS) if deadline else 15
+    if timeout <= DEADLINE_FLOOR_SECONDS:
+        return ""
     if not shutil.which("curl"):
         return ""
     command = [
         "curl",
         "-fsSL",
         "--connect-timeout",
-        "5",
+        f"{min(5.0, timeout):.3f}",
         "--max-time",
-        "15",
+        f"{timeout:.3f}",
         "-A",
         BROWSER_USER_AGENT,
         page_url,
     ]
-    for attempt in range(3):
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                check=True,
-                text=True,
-            )
-            if result.stdout:
-                return html.unescape(result.stdout)
-        except (OSError, subprocess.CalledProcessError):
-            if attempt < 2:
-                time.sleep(0.4)
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        if result.stdout:
+            return html.unescape(result.stdout)
+    except (OSError, subprocess.CalledProcessError):
+        pass
     return ""
 
 
@@ -1054,6 +1248,7 @@ def run_sweep(seed: int | None) -> None:
 def print_sweep_summary(results: list[dict], seed: int) -> None:
     total = len(results)
     with_video = sum(1 for r in results if r["n"] > 0)
+    fast_path = sum(1 for r in results if r["source"] == "fast-path" and r["n"] > 0)
     primary = sum(1 for r in results if r["primary"])
     fallback = sum(1 for r in results if r["fallback"])
     timeouts = sum(1 for r in results if r["error"] == "TimeoutError")
@@ -1066,6 +1261,7 @@ def print_sweep_summary(results: list[dict], seed: int) -> None:
     rows = [
         ("total tested", total),
         ("videos found", with_video),
+        ("  fast-path hits", fast_path),
         ("  primary hits", primary),
         ("  fallback hits", fallback),
         ("no-video", no_video),
@@ -1099,17 +1295,20 @@ def resolve_subtitle_mode(args, title: str) -> str | None:
 
     prompt = "How would you like subtitles?"
     if shutil.which("osascript"):
+        # AppleScript statements are separated by REAL newlines. A literal
+        # backslash-n here is an AppleScript syntax error that gets silently
+        # swallowed, which disabled this dialog entirely from the hotkey.
         script = (
             f'set chosen to choose from list {{"No subtitles", "Live subtitles", "Compile subtitles first"}} '
             f'with prompt {applescript_string(prompt)} '
             f'with title "Video Subtitles" '
-            f'without multiple selections allowed\\n'
-            'if chosen is false then return "Cancel"\\n'
+            'without multiple selections allowed\n'
+            'if chosen is false then return "Cancel"\n'
             'return item 1 of chosen'
         )
         try:
             result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=True)
-            choice = result.stdout.strip("\\n")
+            choice = result.stdout.strip("\n")
             if choice == "No subtitles": return "none"
             if choice == "Live subtitles": return "live"
             if choice == "Compile subtitles first": return "compile"
@@ -1201,12 +1400,15 @@ def stop_subtitle_session(session_id: str) -> None:
 
 
 def ask_open_without_subtitles(error: str) -> bool:
-    prompt = f"Subtitle service failed: {error}\\nOpen video without subtitles?"
+    # Real newline in the prompt: applescript_string turns it into the "\n"
+    # escape AppleScript understands, so the dialog shows two lines.
+    prompt = f"Subtitle service failed: {error}\nOpen video without subtitles?"
     if shutil.which("osascript"):
+        # Statements separated by REAL newlines (see resolve_subtitle_mode).
         script = (
             f'display dialog {applescript_string(prompt)} '
             'buttons {"Cancel", "Open"} default button "Open" cancel button "Cancel" '
-            f'with title "Video Subtitles"\\n'
+            'with title "Video Subtitles"\n'
             'return button returned of result'
         )
         try:
