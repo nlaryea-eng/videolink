@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -16,6 +18,35 @@ try:
 except ModuleNotFoundError as error:
     videolink = None
     VIDEOLINK_IMPORT_ERROR = error
+
+
+class DependencyGuardTests(unittest.TestCase):
+    """Fail — never skip — when the module under test cannot even import.
+
+    Without this, running the suite with the wrong interpreter skips every
+    test and still reports OK, which reads as green when nothing ran.
+    """
+
+    def test_videolink_module_imports(self) -> None:
+        self.assertIsNone(
+            VIDEOLINK_IMPORT_ERROR,
+            f"videolink failed to import ({VIDEOLINK_IMPORT_ERROR}); "
+            "run the suite with the project venv: .venv/bin/python -m unittest",
+        )
+
+
+def isolated_state_file() -> mock._patch:
+    """Point the last-subtitle-window state file at a fresh empty directory.
+
+    open_in_iina(ipc_path=...) consults this file and would otherwise read —
+    and act on — real state left behind by actual subtitle sessions on the
+    developer's machine.
+    """
+    state_dir = tempfile.mkdtemp(prefix="videolink-test-state-")
+    return mock.patch.object(
+        videolink, "LAST_SUBTITLE_WINDOW_FILE",
+        os.path.join(state_dir, "last_iina_socket.txt"),
+    )
 
 
 class FakeResponse:
@@ -52,6 +83,7 @@ class VideoLinkCoreTests(unittest.TestCase):
             mock.patch.object(videolink.shutil, "which", side_effect=fake_which),
             mock.patch.object(videolink.os.path, "exists", return_value=False),
             mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+            isolated_state_file(),
         ):
             opened = videolink.open_in_iina("https://example.com/video.mp4", ipc_path="/tmp/vl.sock")
 
@@ -73,6 +105,7 @@ class VideoLinkCoreTests(unittest.TestCase):
             mock.patch.object(videolink.shutil, "which", side_effect=fake_which),
             mock.patch.object(videolink.os.path, "exists", return_value=False),
             mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+            isolated_state_file(),
         ):
             opened = videolink.open_in_iina("https://example.com/video.mp4")
 
@@ -132,7 +165,7 @@ class VideoLinkCoreTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(session["id"], "session-1")
         request, timeout = requests[0]
-        self.assertEqual(timeout, 20)
+        self.assertEqual(timeout, videolink.SESSION_CREATE_TIMEOUT_SECONDS)
         self.assertEqual(request.full_url, "http://127.0.0.1:8765/sessions")
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["media_url"], "https://cdn.example.com/video.m3u8")
@@ -157,6 +190,117 @@ class VideoLinkCoreTests(unittest.TestCase):
         request, timeout = requests[0]
         self.assertEqual(timeout, 5)
         self.assertEqual(request.full_url, "http://127.0.0.1:8765/sessions/session-1/start")
+
+
+def fake_youtube_dl(info: dict) -> mock.MagicMock:
+    """A yt_dlp.YoutubeDL replacement whose context manager yields `info`."""
+    factory = mock.MagicMock()
+    ydl = factory.return_value.__enter__.return_value
+    ydl.extract_info.return_value = info
+    ydl.sanitize_info.side_effect = lambda payload: payload
+    return factory
+
+
+class StreamResolutionTests(unittest.TestCase):
+    """The live-subtitle flow must hand IINA and ffmpeg real stream URLs,
+    selected by format protocol — URL appearance fails for platforms like
+    YouTube whose stream URLs carry no filename extension."""
+
+    YOUTUBE_LIKE_FORMATS = [
+        {"url": "https://gv.example/prog-360", "protocol": "https",
+         "vcodec": "avc1", "acodec": "mp4a", "height": 360},
+        {"url": "https://gv.example/audio-low", "protocol": "https",
+         "vcodec": "none", "acodec": "mp4a"},
+        {"url": "https://gv.example/audio-best", "protocol": "https",
+         "vcodec": "none", "acodec": "opus"},
+        {"url": "https://gv.example/dash-frags", "protocol": "http_dash_segments",
+         "vcodec": "vp9", "acodec": "none"},
+        {"url": "https://gv.example/video-1080", "protocol": "https",
+         "vcodec": "avc1", "acodec": "none", "height": 1080},
+        {"url": "https://gv.example/video-2160", "protocol": "https",
+         "vcodec": "vp9", "acodec": "none", "height": 2160},
+    ]
+
+    def setUp(self) -> None:
+        if videolink is None:
+            self.skipTest(f"videolink dependencies unavailable: {VIDEOLINK_IMPORT_ERROR}")
+        videolink._RESOLVED_INFO_CACHE.clear()
+
+    def tearDown(self) -> None:
+        if videolink is not None:
+            videolink._RESOLVED_INFO_CACHE.clear()
+
+    def test_selects_capped_high_quality_display_and_best_audio_only_stream(self) -> None:
+        info = {"formats": self.YOUTUBE_LIKE_FORMATS}
+        with mock.patch.object(videolink.yt_dlp, "YoutubeDL", fake_youtube_dl(info)):
+            streams = videolink.resolve_stream_urls(
+                "https://www.youtube.com/watch?v=abc12345678", None)
+
+        self.assertEqual(streams.display_url, "https://gv.example/video-1080")
+        self.assertEqual(streams.audio_url, "https://gv.example/audio-best")
+        self.assertEqual(streams.iina_audio_url, "https://gv.example/audio-best")
+
+    def test_muxed_display_does_not_attach_duplicate_iina_audio(self) -> None:
+        info = {
+            "formats": [
+                {"url": "https://gv.example/prog-720", "protocol": "https",
+                 "vcodec": "avc1", "acodec": "mp4a", "height": 720},
+                {"url": "https://gv.example/audio-best", "protocol": "https",
+                 "vcodec": "none", "acodec": "opus"},
+            ]
+        }
+        with mock.patch.object(videolink.yt_dlp, "YoutubeDL", fake_youtube_dl(info)):
+            streams = videolink.resolve_stream_urls(
+                "https://www.youtube.com/watch?v=abc12345678", None)
+
+        self.assertEqual(streams.display_url, "https://gv.example/prog-720")
+        self.assertEqual(streams.audio_url, "https://gv.example/audio-best")
+        self.assertIsNone(streams.iina_audio_url)
+
+    def test_generic_file_without_codec_info_streams_as_is(self) -> None:
+        info = {"formats": [{"url": "https://cdn.example.com/stream", "protocol": "https"}]}
+        with mock.patch.object(videolink.yt_dlp, "YoutubeDL", fake_youtube_dl(info)):
+            streams = videolink.resolve_stream_urls("https://news.example.com/story", None)
+        self.assertEqual(streams.display_url, "https://cdn.example.com/stream")
+        self.assertEqual(streams.audio_url, "https://cdn.example.com/stream")
+        self.assertIsNone(streams.iina_audio_url)
+
+    def test_playlist_info_returns_none(self) -> None:
+        info = {"entries": [{"id": "a"}, {"id": "b"}]}
+        with mock.patch.object(videolink.yt_dlp, "YoutubeDL", fake_youtube_dl(info)):
+            self.assertIsNone(
+                videolink.resolve_stream_urls("https://example.com/playlist", None))
+
+    def test_direct_media_path_url_skips_resolution_entirely(self) -> None:
+        url = "https://cdn.example.com/live/master.m3u8?token=1"
+        with mock.patch.object(
+            videolink.yt_dlp, "YoutubeDL",
+            side_effect=AssertionError("YoutubeDL must not be constructed"),
+        ):
+            streams = videolink.resolve_stream_urls(url, None)
+        self.assertEqual(streams.display_url, url)
+        self.assertEqual(streams.audio_url, url)
+        self.assertIsNone(streams.iina_audio_url)
+
+    def test_extraction_probe_results_are_reused_without_second_resolution(self) -> None:
+        """ydl_extract caches full infos; the live flow must not resolve twice."""
+        page_url = "https://www.youtube.com/watch?v=abc12345678"
+        info = {"webpage_url": page_url, "title": "Clip",
+                "extractor_key": "Youtube", "formats": self.YOUTUBE_LIKE_FORMATS}
+
+        with mock.patch.object(videolink.yt_dlp, "YoutubeDL", fake_youtube_dl(info)):
+            videos = videolink.ydl_extract("https://embed.example.com/player", None)
+        self.assertEqual(videos, [("Clip", page_url)])
+
+        with mock.patch.object(
+            videolink.yt_dlp, "YoutubeDL",
+            side_effect=AssertionError("second resolution must hit the cache"),
+        ):
+            streams = videolink.resolve_stream_urls(page_url, None)
+
+        self.assertEqual(streams.display_url, "https://gv.example/video-1080")
+        self.assertEqual(streams.audio_url, "https://gv.example/audio-best")
+        self.assertEqual(streams.iina_audio_url, "https://gv.example/audio-best")
 
 
 class ResolverRedesignTests(unittest.TestCase):
@@ -192,6 +336,23 @@ class ResolverRedesignTests(unittest.TestCase):
 
         self.assertEqual(source, "fast-path")
         self.assertEqual(videos, [(url, url)])
+
+    def test_fast_path_ignores_media_filenames_in_query_strings(self) -> None:
+        """?video=clip.mp4 in an article URL must not be mistaken for the video."""
+        for url in (
+            "https://news.example.com/article?video=clip.mp4",
+            "https://example.com/watch?file=video.mp4&autoplay=1",
+            "https://example.com/story#promo.m3u8",
+        ):
+            self.assertIsNone(videolink.fast_path_videos(url), url)
+
+        # Real media paths (including BILD delivery manifests) still fast-path.
+        for url in (
+            "https://vcdn02.spiegel.de/videos/clip.mp4",
+            "https://cdn.example.com/live/master.m3u8?token=abc",
+            "https://hds.ak.token.bild.de/video/master.m3u8,delivery=hls",
+        ):
+            self.assertEqual(videolink.fast_path_videos(url), [(url, url)], url)
 
     def test_fast_path_denylists_bild_so_delivery_preference_runs(self) -> None:
         """BILD article URLs must NOT fast-path: the fragile-host swap to
@@ -416,6 +577,157 @@ class ResolverRedesignTests(unittest.TestCase):
         self.assertIn('with title "Video Subtitles"\nreturn button returned of result', script)
         # ...while the newline inside the prompt string uses AppleScript's \n escape.
         self.assertIn("\\nOpen video without subtitles?", script)
+
+
+class LiveFlowTests(unittest.TestCase):
+    """Ordering, budgets, and truthfulness of the live-subtitle hotkey flow."""
+
+    def setUp(self) -> None:
+        if videolink is None:
+            self.skipTest(f"videolink dependencies unavailable: {VIDEOLINK_IMPORT_ERROR}")
+
+    def test_previous_window_closed_only_after_successful_ipc_launch(self) -> None:
+        state_dir = tempfile.mkdtemp(prefix="videolink-test-state-")
+        state_file = os.path.join(state_dir, "last_iina_socket.txt")
+        with open(state_file, "w", encoding="utf-8") as handle:
+            handle.write("/tmp/vl-old.sock")
+
+        calls: list[list[str]] = []
+
+        def fake_which(name: str) -> str | None:
+            return "/usr/local/bin/iina" if name == "iina" else None
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command[0] == "pgrep":
+                return subprocess.CompletedProcess(command, 0, stdout="4242\n", stderr="")
+            if command[0] == "ps":
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    stdout="/Applications/IINA.app/Contents/MacOS/IINA --mpv-input-ipc-server=/tmp/vl-old.sock\n",
+                    stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(videolink.shutil, "which", side_effect=fake_which),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(videolink, "LAST_SUBTITLE_WINDOW_FILE", state_file),
+        ):
+            opened = videolink.open_in_iina(
+                "https://cdn.example.com/v.m3u8", ipc_path="/tmp/vl-new.sock")
+
+        self.assertTrue(opened)
+        self.assertEqual(calls[0][0], "/usr/local/bin/iina",
+                         "the NEW window must launch before the old one is touched")
+        self.assertIn(["kill", "4242"], calls)
+        with open(state_file, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "/tmp/vl-new.sock")
+
+    def test_iina_launch_attaches_external_audio_for_video_only_display(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_which(name: str) -> str | None:
+            return "/usr/local/bin/iina" if name == "iina" else None
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(videolink.shutil, "which", side_effect=fake_which),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+            isolated_state_file(),
+        ):
+            opened = videolink.open_in_iina(
+                "https://gv.example/video-1080",
+                ipc_path="/tmp/vl-new.sock",
+                audio_url="https://gv.example/audio-best",
+            )
+
+        self.assertTrue(opened)
+        self.assertIn("--audio-file=https://gv.example/audio-best", calls[0])
+
+    def test_stream_resolution_overlaps_with_dialog_time(self) -> None:
+        def slow_resolve(url, cookies, deadline=None):
+            time.sleep(0.3)
+            return videolink.StreamSelection("https://d.example/v", "https://a.example/a")
+
+        with mock.patch.object(videolink, "resolve_stream_urls", side_effect=slow_resolve):
+            wait = videolink.begin_stream_resolution("https://x.example/page", None)
+            time.sleep(0.35)  # the human reading the dialog
+            start = time.monotonic()
+            streams = wait()
+            waited = time.monotonic() - start
+
+        self.assertEqual(streams.display_url, "https://d.example/v")
+        self.assertEqual(streams.audio_url, "https://a.example/a")
+        self.assertLess(waited, 0.1, "resolution must already be done after dialog time")
+
+    def test_subtitles_flag_is_validated(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            videolink.parse_args(["--subtitles", "compile"])
+        self.assertEqual(caught.exception.code, 2)
+
+        self.assertEqual(videolink.parse_args(["--subtitles", "LIVE"]).subtitles, "live")
+        self.assertEqual(videolink.parse_args(["--subtitles=none"]).subtitles, "none")
+
+    def test_subtitle_mode_may_be_live_matches_resolution_outcomes(self) -> None:
+        cases = [
+            (["--subtitle-auto"], True),
+            (["--subtitle-prompt"], True),
+            (["--subtitles", "live"], True),
+            (["--subtitles", "none"], False),
+            (["--subtitle-prompt", "--no-subtitle-prompt"], False),
+            ([], False),
+        ]
+        for argv, expected in cases:
+            self.assertIs(
+                videolink.subtitle_mode_may_be_live(videolink.parse_args(argv)),
+                expected, argv)
+
+    def test_compile_option_is_gone_from_subtitle_dialog(self) -> None:
+        scripts: list[str] = []
+
+        def fake_run(command, **kwargs):
+            scripts.append(command[2])
+            return subprocess.CompletedProcess(command, 0, stdout="Live subtitles\n", stderr="")
+
+        args = videolink.parse_args(["--subtitle-prompt"])
+        with (
+            mock.patch.object(videolink.shutil, "which", return_value="/usr/bin/osascript"),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+        ):
+            videolink.resolve_subtitle_mode(args, "Title")
+
+        self.assertNotIn("Compile", scripts[0], "the compile option was a no-op and must stay gone")
+
+    def test_live_mode_with_broken_session_response_asks_instead_of_crashing(self) -> None:
+        """A session dict missing ipc_socket_path used to raise KeyError."""
+        asked: list[str] = []
+
+        def fake_ask(detail: str) -> bool:
+            asked.append(detail)
+            return False  # user declines the no-subtitles fallback
+
+        with (
+            mock.patch.object(videolink.sys, "argv",
+                              ["videolink.py", "--subtitle-auto", "https://news.example.com/story"]),
+            mock.patch.object(videolink, "extract_with_timeout",
+                              return_value=([("Clip", "https://x.example/clip")], "primary", None)),
+            mock.patch.object(videolink, "copy_to_clipboard", return_value=True),
+            mock.patch.object(videolink, "begin_stream_resolution",
+                              return_value=lambda: videolink.StreamSelection(
+                                  "https://d.example/v", "https://a.example/a")),
+            mock.patch.object(videolink, "create_live_subtitle_session",
+                              return_value=({"id": "s1"}, None)),  # no ipc_socket_path
+            mock.patch.object(videolink, "ask_open_without_subtitles", side_effect=fake_ask),
+            mock.patch.object(videolink, "open_in_iina",
+                              side_effect=AssertionError("must not open without consent")),
+            mock.patch.object(videolink, "notify"),
+        ):
+            videolink.main()
+
+        self.assertEqual(len(asked), 1)
 
 
 class SubtitleServiceStatusTests(unittest.TestCase):

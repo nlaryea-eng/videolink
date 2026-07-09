@@ -39,6 +39,7 @@ import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
+from typing import NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -126,6 +127,12 @@ SUPPORTED_BROWSERS = (
 # tool must never hang, so we abandon extraction after this many seconds.
 EXTRACT_TIMEOUT_SECONDS = 12
 
+# The live-subtitle flow stacks three network stages (extract, stream resolve,
+# session create). Each gets its own hard cap so the worst case stays ~30s
+# instead of the ~44s the old per-stage defaults added up to.
+LIVE_RESOLVE_TIMEOUT_SECONDS = 10
+SESSION_CREATE_TIMEOUT_SECONDS = 8
+
 # One HTML fetch may only consume a short slice of the overall budget, so the
 # candidate probes and the generic last resort still have time to run.
 FETCH_BUDGET_CAP_SECONDS = 6
@@ -149,6 +156,17 @@ SUBTITLE_SERVICE_URL = os.environ.get(
     "http://127.0.0.1:8765",
 ).rstrip("/")
 IINA_BUNDLED_CLI = "/Applications/IINA.app/Contents/MacOS/iina-cli"
+
+# VIDEOLINK_TIMINGS=1 prints per-stage wall-clock marks to stderr, measured
+# from process start — the closest observable proxy for the hotkey press.
+TIMINGS_ENABLED = os.environ.get("VIDEOLINK_TIMINGS") == "1"
+_TIMING_START = time.monotonic()
+
+
+def mark_timing(stage: str) -> None:
+    if TIMINGS_ENABLED:
+        print(f"[timing] {time.monotonic() - _TIMING_START:6.2f}s  {stage}",
+              file=sys.stderr, flush=True)
 
 
 class QuietLogger:
@@ -276,8 +294,64 @@ def iina_cli_commands(url: str, mpv_args: list[str]) -> list[list[str]]:
     return commands
 
 
-def open_in_iina(url: str, ipc_path: str | None = None) -> bool:
-    mpv_args = [f"--mpv-input-ipc-server={ipc_path}"] if ipc_path else []
+LAST_SUBTITLE_WINDOW_FILE = os.path.join(
+    os.path.expanduser("~/Library/Application Support/VideoLink"), "last_iina_socket.txt"
+)
+
+
+def close_previous_subtitle_window() -> None:
+    # Subtitle sessions force --separate-windows (see iina_cli_commands), so
+    # unlike plain playback (which reuses IINA's single window normally),
+    # every subtitle-enabled keybind press spawns a brand-new IINA process
+    # that never gets closed on its own. The use case is always one video at
+    # a time, so close whichever one this tool opened last before opening a
+    # new one - otherwise IINA processes (and their GPU/network/CPU use) pile
+    # up silently across a session, exactly the kind of thing that makes
+    # later attempts flaky.
+    try:
+        with open(LAST_SUBTITLE_WINDOW_FILE, "r", encoding="utf-8") as handle:
+            fingerprint = handle.read().strip()
+    except OSError:
+        return
+    if not fingerprint:
+        return
+    try:
+        result = subprocess.run(["pgrep", "-f", fingerprint], capture_output=True, text=True, check=False)
+    except OSError:
+        return
+    for pid_str in result.stdout.split():
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        check = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False)
+        if "IINA" not in check.stdout:
+            continue  # the pid was reused for something else since - don't touch it
+        try:
+            subprocess.run(["kill", str(pid)], check=False)
+        except OSError:
+            pass
+
+
+def remember_subtitle_window(ipc_path: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(LAST_SUBTITLE_WINDOW_FILE), exist_ok=True)
+        with open(LAST_SUBTITLE_WINDOW_FILE, "w", encoding="utf-8") as handle:
+            handle.write(ipc_path)
+    except OSError:
+        pass
+
+
+def open_in_iina(
+    url: str,
+    ipc_path: str | None = None,
+    audio_url: str | None = None,
+) -> bool:
+    mpv_args = []
+    if ipc_path:
+        mpv_args.append(f"--mpv-input-ipc-server={ipc_path}")
+    if audio_url:
+        mpv_args.append(f"--audio-file={audio_url}")
     commands = iina_cli_commands(url, mpv_args)
 
     # The macOS `open -a ... --args` path does not reliably pass mpv IPC options
@@ -294,6 +368,13 @@ def open_in_iina(url: str, ipc_path: str | None = None) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            if ipc_path:
+                # Close the old window only once the new launch has succeeded:
+                # closing first would trade a working video for a failed one
+                # whenever the launch errors. Order matters — close reads the
+                # OLD fingerprint before remember overwrites it.
+                close_previous_subtitle_window()
+                remember_subtitle_window(ipc_path)
             return True
         except (OSError, subprocess.CalledProcessError):
             continue
@@ -433,7 +514,7 @@ def fast_path_videos(page_url: str) -> list[tuple[str, str]] | None:
     seconds of network work whose output gets discarded. Playlist-ish
     extractor matches are excluded so the multi-video picker still works.
     """
-    if looks_like_direct_media_url(page_url):
+    if is_direct_media_page_url(page_url):
         return [(page_url, page_url)]
 
     name = specific_extractor_name(page_url)
@@ -456,6 +537,37 @@ def normalize_page_url(raw_url: str) -> str:
 def looks_like_url(value: str) -> bool:
     parsed = urlparse(value)
     return bool(parsed.scheme in {"http", "https"} and parsed.netloc and "." in parsed.netloc)
+
+
+def is_direct_media_page_url(value: str | None) -> bool:
+    """Strict gate for the zero-network fast path: only the URL *path* counts.
+
+    A media filename inside a query string (?video=clip.mp4) is routinely part
+    of an ordinary article URL, so it must never short-circuit extraction —
+    copying such a page would hand IINA an HTML document. The broader
+    looks_like_direct_media_url stays in use where the input is already a
+    candidate media URL (format lists, <video src>, JSON-LD contentUrl).
+    """
+    if not value:
+        return False
+
+    normalized = html.unescape(value)
+    if any(character in normalized for character in "\"'<>"):
+        return False
+
+    try:
+        parsed = urlparse(normalized)
+    except ValueError:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    return (
+        parsed.path.lower().endswith(DIRECT_VIDEO_EXTENSIONS)
+        # BILD delivery manifests carry ",delivery=hls" inside the path.
+        or delivery_kind(normalized) is not None
+    )
 
 
 def looks_like_direct_media_url(value: str | None) -> bool:
@@ -640,6 +752,8 @@ def ydl_extract(
         return []  # unsupported / no video on this URL — let the caller try a fallback
 
     entries = info.get("entries")
+    if entries is None and info.get("formats"):
+        cache_resolved_info(info, target_url)
     items = list(entries) if entries is not None else [info]
 
     videos: list[tuple[str, str]] = []
@@ -661,58 +775,175 @@ def ydl_extract(
     return dedupe_videos(videos)
 
 
-def resolve_direct_media_url(url: str, cookies_browser: str | None) -> str | None:
-    """Best-effort: resolve a chosen video to a directly-streamable URL.
+# Fully-resolved single-video infos from this run, keyed by every URL that
+# names them. Lets the live-subtitle flow reuse the extraction pass's yt-dlp
+# work instead of paying for a second full resolution of the same video.
+_RESOLVED_INFO_CACHE: dict[str, dict] = {}
+_RESOLVED_INFO_CACHE_LIMIT = 64
+
+
+def cache_resolved_info(info: dict, target_url: str) -> None:
+    if len(_RESOLVED_INFO_CACHE) >= _RESOLVED_INFO_CACHE_LIMIT:
+        _RESOLVED_INFO_CACHE.clear()  # tiny process-lifetime cache; keep it dumb
+    for key in {target_url, info.get("webpage_url"), info.get("original_url")}:
+        if key:
+            _RESOLVED_INFO_CACHE[key] = info
+
+
+# ffmpeg and IINA can stream these yt-dlp protocols straight from a URL.
+# http_dash_segments is a fragment list, not a fetchable stream, so it's out.
+NON_STREAMABLE_PROTOCOLS = {"http_dash_segments"}
+DISPLAY_HEIGHT_CAP = 1080
+
+
+class StreamSelection(NamedTuple):
+    display_url: str
+    audio_url: str
+    iina_audio_url: str | None = None
+
+
+def format_protocol(fmt: dict) -> str:
+    protocol = str(fmt.get("protocol") or "").lower()
+    if protocol:
+        return protocol
+    url = str(fmt.get("url") or "").lower()
+    if ".m3u8" in url:
+        return "m3u8"
+    if url.startswith(("http://", "https://")):
+        return "https"
+    return ""
+
+
+def is_streamable_format(fmt) -> bool:
+    if not isinstance(fmt, dict) or not fmt.get("url"):
+        return False
+    protocol = format_protocol(fmt)
+    if protocol in NON_STREAMABLE_PROTOCOLS:
+        return False
+    return protocol.startswith(("m3u8", "http"))
+
+
+def format_has_video(fmt: dict) -> bool:
+    return fmt.get("vcodec") != "none"  # None/absent means unknown, not absent
+
+
+def format_has_audio(fmt: dict) -> bool:
+    return fmt.get("acodec") != "none"
+
+
+def format_height(fmt: dict) -> int | None:
+    height = fmt.get("height")
+    return height if isinstance(height, int) else None
+
+
+def select_stream_urls(info: dict) -> StreamSelection | None:
+    """Pick playback and transcription streams from a resolved yt-dlp info dict.
+
+    yt-dlp sorts formats worst-to-best, so the LAST match wins. The two
+    consumers want different things: IINA gets a high-quality video stream
+    capped at 1080p, with external audio attached when the video stream is
+    video-only; ffmpeg only feeds audio to whisper, so an audio-only stream
+    avoids hauling video bytes that get thrown away. Judging by format
+    *protocol* instead of URL appearance is what makes this work for platforms
+    whose stream URLs carry no filename extension (googlevideo, etc.).
+    """
+    formats = [fmt for fmt in info.get("formats") or [] if is_streamable_format(fmt)]
+    if not formats:
+        top_level = {key: info.get(key) for key in ("url", "protocol", "vcodec", "acodec")}
+        if not is_streamable_format(top_level):
+            return None
+        formats = [top_level]
+
+    video_formats = [fmt for fmt in formats if format_has_video(fmt)]
+    if not video_formats:
+        return None
+    capped_video_formats = [
+        fmt for fmt in video_formats
+        if (height := format_height(fmt)) is None or height <= DISPLAY_HEIGHT_CAP
+    ]
+    display = (capped_video_formats or video_formats)[-1]
+
+    audio_only = [fmt for fmt in formats if fmt.get("vcodec") == "none" and format_has_audio(fmt)]
+    audio = audio_only[-1] if audio_only else display
+    iina_audio_url = (
+        audio["url"]
+        if not format_has_audio(display) and audio is not display and format_has_audio(audio)
+        else None
+    )
+    return StreamSelection(display["url"], audio["url"], iina_audio_url)
+
+
+def resolve_stream_urls(
+    url: str, cookies_browser: str | None, deadline: Deadline | None = None
+) -> StreamSelection | None:
+    """Resolve a chosen video to (display_url, audio_url) real stream URLs.
 
     For most sites, ydl_extract() intentionally returns the durable webpage_url
-    instead of a format URL (see the comment above) so a copied/pasted link
-    doesn't expire. IINA can usually still open that page URL itself (it has
-    its own bundled resolver), but ffmpeg (used by the subtitle pipeline)
-    cannot, and IINA's own resolver is sometimes slower or less capable than
-    ours — e.g. it can leave the mpv IPC socket unbound for longer than we
-    wait for it. So when live subtitles are requested, we re-resolve here and
-    hand IINA/the subtitle service a real stream URL instead.
+    instead of a format URL so a copied/pasted link doesn't expire. IINA can
+    usually still open that page URL itself (it has its own bundled resolver),
+    but ffmpeg (used by the subtitle pipeline) cannot, and IINA's own resolver
+    is sometimes slower or less capable than ours — e.g. it can leave the mpv
+    IPC socket unbound for longer than we wait for it. So when live subtitles
+    are requested, we resolve here and hand IINA and the subtitle service real
+    stream URLs instead.
     """
-    if looks_like_direct_media_url(url):
-        return url
+    if is_direct_media_page_url(url):
+        return StreamSelection(url, url)
 
-    opts = dict(YDL_OPTS)
-    if cookies_browser:
-        opts["cookiesfrombrowser"] = (cookies_browser,)
+    info = _RESOLVED_INFO_CACHE.get(url)
+    if info is None:
+        opts = dict(YDL_OPTS)
+        if cookies_browser:
+            opts["cookiesfrombrowser"] = (cookies_browser,)
+        if deadline is not None:
+            remaining = deadline.remaining(cap=10.0)
+            if remaining <= DEADLINE_FLOOR_SECONDS:
+                return None
+            opts["socket_timeout"] = remaining
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.sanitize_info(ydl.extract_info(url, download=False))
+        except yt_dlp.utils.DownloadError:
+            info = None
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.sanitize_info(ydl.extract_info(url, download=False))
-    except yt_dlp.utils.DownloadError:
-        return None
+    if not info or info.get("entries"):
+        # Unresolvable or a playlist page. If the chosen URL itself already
+        # looks like media (og:video, JSON-LD, format URL), stream it as-is.
+        return StreamSelection(url, url) if looks_like_direct_media_url(url) else None
 
-    if info.get("entries"):
-        return None  # a playlist/picker page; the caller already chose one video
-
-    candidate = info.get("url")
-    if looks_like_direct_media_url(candidate):
-        return candidate
-
-    for fmt in info.get("formats") or []:
-        if isinstance(fmt, dict) and looks_like_direct_media_url(fmt.get("url")):
-            candidate = fmt["url"]
-    return candidate if looks_like_direct_media_url(candidate) else None
+    streams = select_stream_urls(info)
+    if streams:
+        return streams
+    return StreamSelection(url, url) if looks_like_direct_media_url(url) else None
 
 
-def resolve_direct_media_url_with_timeout(url: str, cookies_browser: str | None) -> str | None:
-    """Same timeout guarantee as extract_with_timeout: never hang the keybind."""
+def begin_stream_resolution(url: str, cookies_browser: str | None):
+    """Start resolving stream URLs in the background; returns a wait() callable.
+
+    Kicked off BEFORE the subtitle dialog, so the network resolution runs
+    while the human is choosing — by the time "Live subtitles" is picked the
+    streams are usually already there. wait() carries the same never-hang
+    guarantee as extract_with_timeout: it returns None once the resolution
+    budget (plus a small grace period for the deadline-capped sockets to
+    unwind) is exhausted.
+    """
     result: dict[str, object] = {}
+    deadline = Deadline(LIVE_RESOLVE_TIMEOUT_SECONDS)
 
     def worker():
         try:
-            result["url"] = resolve_direct_media_url(url, cookies_browser)
+            result["streams"] = resolve_stream_urls(url, cookies_browser, deadline)
         except Exception:
-            result["url"] = None
+            result["streams"] = None
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    thread.join(EXTRACT_TIMEOUT_SECONDS)
-    return result.get("url") if not thread.is_alive() else None
+
+    def wait() -> StreamSelection | None:
+        thread.join(deadline.remaining() + 2.0)
+        return result.get("streams") if not thread.is_alive() else None
+
+    return wait
 
 
 def direct_media_formats(item: dict) -> list[dict]:
@@ -1283,6 +1514,12 @@ def parse_args(argv: list[str]) -> Args:
 
     if args.cookies_browser is not None:
         args.cookies_browser = validate_browser(args.cookies_browser)
+    if args.subtitles is not None:
+        args.subtitles = args.subtitles.strip().lower()
+        if args.subtitles not in {"none", "live"}:
+            print(f"error: --subtitles must be 'none' or 'live', got {args.subtitles!r}",
+                  file=sys.stderr)
+            sys.exit(2)
     args.subtitle_service_url = (args.subtitle_service_url or SUBTITLE_SERVICE_URL).rstrip("/")
 
     return args
@@ -1392,6 +1629,15 @@ def print_sweep_summary(results: list[dict], seed: int) -> None:
         print(f"    {r['elapsed']:>5}s  {short(r['url'], 40):<40} {tag}")
 
 
+def subtitle_mode_may_be_live(args) -> bool:
+    """True when the flow below could still end up in live-subtitle mode."""
+    if args.subtitles:
+        return args.subtitles == "live"
+    if args.no_subtitle_prompt:
+        return False
+    return args.want_subtitle_auto or args.want_subtitle_prompt
+
+
 def resolve_subtitle_mode(args, title: str) -> str | None:
     if args.subtitles:
         return args.subtitles
@@ -1408,7 +1654,7 @@ def resolve_subtitle_mode(args, title: str) -> str | None:
         # backslash-n here is an AppleScript syntax error that gets silently
         # swallowed, which disabled this dialog entirely from the hotkey.
         script = (
-            f'set chosen to choose from list {{"No subtitles", "Live subtitles", "Compile subtitles first"}} '
+            f'set chosen to choose from list {{"No subtitles", "Live subtitles"}} '
             f'with prompt {applescript_string(prompt)} '
             f'with title "Video Subtitles" '
             'without multiple selections allowed\n'
@@ -1420,16 +1666,14 @@ def resolve_subtitle_mode(args, title: str) -> str | None:
             choice = result.stdout.strip("\n")
             if choice == "No subtitles": return "none"
             if choice == "Live subtitles": return "live"
-            if choice == "Compile subtitles first": return "compile"
             if choice == "Cancel": return None
         except (OSError, subprocess.CalledProcessError):
             pass
 
     if sys.stdin.isatty():
-        choice = choose_in_terminal(["No subtitles", "Live subtitles", "Compile subtitles first"], prompt)
+        choice = choose_in_terminal(["No subtitles", "Live subtitles"], prompt)
         if choice == 0: return "none"
         if choice == 1: return "live"
-        if choice == 2: return "compile"
         return None
 
     return "none"
@@ -1459,7 +1703,7 @@ def create_live_subtitle_session(media_url: str, title: str, language: str, mode
         method="POST",
     )
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=SESSION_CREATE_TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8")), None
     except HTTPError as error:
         try:
@@ -1553,6 +1797,7 @@ def main() -> None:
             sys.exit(1)
 
     videos, _source, error = extract_with_timeout(page_url, args.cookies_browser)
+    mark_timing(f"extracted ({_source})")
 
     if not videos:
         if isinstance(error, TimeoutError):
@@ -1576,41 +1821,65 @@ def main() -> None:
 
     copied = copy_to_clipboard(payload)
 
+    # Stream resolution needs the network; the subtitle dialog needs the
+    # human. Run them concurrently so picking "Live subtitles" costs almost
+    # no extra wall time on top of the dialog itself.
+    wait_for_streams = None
+    if subtitle_mode_may_be_live(args):
+        wait_for_streams = begin_stream_resolution(chosen, args.cookies_browser)
+
     subtitle_mode = resolve_subtitle_mode(args, title)
     if subtitle_mode is None:
-        notify("Cancelled — video was not opened.")
+        if copied:
+            notify("Cancelled — link copied, but video was not opened.")
+        else:
+            notify("Cancelled — video was not opened.")
         return
 
     opened = False
-    if subtitle_mode == "none":
-        opened = open_in_iina(chosen)
-    elif subtitle_mode == "live":
-        direct_url = resolve_direct_media_url_with_timeout(chosen, args.cookies_browser) or chosen
+    if subtitle_mode == "live":
+        streams = wait_for_streams() if wait_for_streams else None
+        mark_timing("streams resolved" if streams else "stream resolution failed")
+        if streams:
+            display_url = streams.display_url
+            audio_url = streams.audio_url
+            iina_audio_url = streams.iina_audio_url
+        else:
+            display_url = audio_url = chosen
+            iina_audio_url = None
         session, session_error = create_live_subtitle_session(
-            media_url=direct_url,
+            media_url=audio_url,
             title=title,
             language=args.subtitle_language,
             model=args.subtitle_model
         )
-        if session is None:
-            if ask_open_without_subtitles(session_error or "Unknown error"):
+        # Guard the response shape too: a session without an id or socket
+        # path is as unusable as no session, and must not crash the hotkey.
+        ipc_socket_path = (session or {}).get("ipc_socket_path")
+        session_id = (session or {}).get("id")
+        if not ipc_socket_path or not session_id:
+            detail = session_error or "service response missing session id or IPC socket path"
+            if ask_open_without_subtitles(detail):
                 opened = open_in_iina(chosen)
             else:
                 return
         else:
-            opened = open_in_iina(direct_url, ipc_path=session['ipc_socket_path'])
+            mark_timing("subtitle session created")
+            opened = open_in_iina(display_url, ipc_path=ipc_socket_path, audio_url=iina_audio_url)
+            mark_timing("IINA launched" if opened else "IINA launch failed")
             if opened:
-                started, start_error = start_live_subtitle_session(session['id'])
+                started, start_error = start_live_subtitle_session(session_id)
+                mark_timing("live subtitles started")
                 if not started:
-                    stop_subtitle_session(session['id'])
+                    stop_subtitle_session(session_id)
                     notify(
                         "Opened in IINA, but couldn't start live subtitles: "
                         f"{start_error or 'Unknown error'}"
                     )
                     return
             else:
-                stop_subtitle_session(session['id'])
-    elif subtitle_mode == "compile":
+                stop_subtitle_session(session_id)
+    else:
         opened = open_in_iina(chosen)
 
     if copied and opened:
