@@ -625,7 +625,12 @@ def default_srt_path(session_id: str) -> str:
 def write_srt(captions: list["CaptionCue"], srt_path: str) -> None:
     path = Path(srt_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    # Unique per call: a fixed "<path>.tmp" name collides when two threads
+    # (e.g. asr_worker_thread finishing a chunk and a seek restart) write the
+    # same session's SRT concurrently - whichever os.replace() runs second
+    # then fails with FileNotFoundError because the first already renamed
+    # its tmp file away, silently killing whichever thread hit it.
+    tmp_path = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
     with open(tmp_path, "w", encoding="utf-8") as handle:
         for cue in captions:
             handle.write(f"{cue.index}\n")
@@ -1610,8 +1615,20 @@ def perform_seek(session_id: str, position_seconds: float) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Session not found")
 
     stop_session(session)
-    if session.pipeline_task and session.pipeline_task.is_alive():
-        session.pipeline_task.join(timeout=5.0)
+    # run_caption_pipeline's own wait loop exits as soon as cancel_event is
+    # set, without waiting for its worker threads - so joining only
+    # pipeline_task lets this proceed to truncate/rewrite the SRT file while
+    # asr_worker_thread (or the old renderer/seek-watcher) may still be
+    # mid-chunk. Join every worker explicitly so the old generation is fully
+    # stopped before anything below touches shared session state. perform_seek
+    # can itself be called from seek_watcher_thread, so skip joining whichever
+    # thread is currently running this code - Thread.join() on the calling
+    # thread raises RuntimeError.
+    current_thread = threading.current_thread()
+    for worker in (session.pipeline_task, session.ffmpeg_thread, session.asr_task,
+                   session.renderer_task, session.seek_watcher_task):
+        if worker and worker is not current_thread and worker.is_alive():
+            worker.join(timeout=5.0)
 
     session.request.start_offset_seconds = position_seconds
     session.cursor_seconds = position_seconds
