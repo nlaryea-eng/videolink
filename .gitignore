@@ -3,3 +3,22 @@ __pycache__/
 *.pyc
 .env
 .env.local
+.DS_Store
+
+# Local runtime output
+*.log
+*.sqlite3
+*.db
+*.srt
+*.vtt
+
+# Local scraper/travel experiments and generated results
+.fare_scraper_cache/
+fare-flights/
+scrapes/
+fare_dashboard.html
+route_opportunity.json
+*_results.json
+*_mock_results.json
+profiles.yml
+scraper_sources.yml
