@@ -12,6 +12,8 @@ import time
 import unittest
 from unittest import mock
 
+import resolver_core
+
 try:
     import videolink
     VIDEOLINK_IMPORT_ERROR = None
@@ -201,6 +203,77 @@ def fake_youtube_dl(info: dict) -> mock.MagicMock:
     return factory
 
 
+class ResolverCoreTests(unittest.TestCase):
+    """Pure resolver-core behavior that should survive the daemon migration."""
+
+    def test_scored_candidates_prioritize_platform_and_jsonld_over_previews(self) -> None:
+        page = """
+        <meta property="og:video" content="https://cdn.example.com/preview-lowres.mp4">
+        <iframe src="https://embed.example.com/player/real"></iframe>
+        <script type="application/ld+json">
+        {
+          "@type": "VideoObject",
+          "name": "Structured clip",
+          "embedUrl": "https://json.example.com/watch/abc",
+          "contentUrl": "https://cdn.example.com/live/master.m3u8"
+        }
+        </script>
+        """
+
+        def fake_match(url: str) -> str | None:
+            return "Example" if "example.com/player" in url or "json.example.com" in url else None
+
+        candidates = resolver_core.discover_scored_candidates(
+            page,
+            "https://news.example.com/story",
+            match_extractor=fake_match,
+        )
+
+        self.assertEqual(
+            [(candidate.kind, candidate.url, candidate.needs_probe) for candidate in candidates],
+            [
+                ("platform_embed", "https://embed.example.com/player/real", True),
+                ("jsonld_platform", "https://json.example.com/watch/abc", True),
+                ("direct_file", "https://cdn.example.com/live/master.m3u8", False),
+                ("og_video", "https://cdn.example.com/preview-lowres.mp4", False),
+            ],
+        )
+        self.assertEqual(
+            resolver_core.discover_embed_candidate_urls(
+                page,
+                "https://news.example.com/story",
+                match_extractor=fake_match,
+            ),
+            [
+                "https://embed.example.com/player/real",
+                "https://json.example.com/watch/abc",
+            ],
+        )
+
+    def test_cache_key_includes_ytdlp_version_and_normalized_url(self) -> None:
+        self.assertEqual(
+            resolver_core.cache_key("example.com/watch?v=1", ytdlp_version="2026.test"),
+            "2026.test|https://example.com/watch?v=1",
+        )
+        self.assertNotEqual(
+            resolver_core.cache_key("https://example.com/watch?v=1", ytdlp_version="old"),
+            resolver_core.cache_key("https://example.com/watch?v=1", ytdlp_version="new"),
+        )
+
+    def test_extraction_error_classification_is_actionable(self) -> None:
+        cases = {
+            "HTTP Error 403: forbidden; try cookies": "login_wall",
+            "This video is not available in your country": "geo_blocked",
+            "subscriber-only premium video": "paywall",
+            "operation timed out": "timeout",
+            "Unsupported URL: https://example.com/story": "no_video",
+            "unexpected extractor failure": "unknown",
+            None: "unknown",
+        }
+        for message, expected in cases.items():
+            self.assertEqual(resolver_core.classify_extraction_error(message), expected)
+
+
 class StreamResolutionTests(unittest.TestCase):
     """The live-subtitle flow must hand IINA and ffmpeg real stream URLs,
     selected by format protocol — URL appearance fails for platforms like
@@ -342,6 +415,7 @@ class ResolverRedesignTests(unittest.TestCase):
         for url in (
             "https://news.example.com/article?video=clip.mp4",
             "https://example.com/watch?file=video.mp4&autoplay=1",
+            "https://news.example.com/article?delivery=hls",
             "https://example.com/story#promo.m3u8",
         ):
             self.assertIsNone(videolink.fast_path_videos(url), url)
