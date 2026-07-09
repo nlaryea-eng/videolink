@@ -52,7 +52,7 @@ SUBTITLE_OUTPUT_DIR = Path(os.environ.get(
 )).expanduser()
 SAMPLE_RATE = 16000
 BYTES_PER_PCM_SECOND = SAMPLE_RATE * 2
-DEFAULT_CHUNK_SECONDS = float(os.environ.get("VIDEOLINK_CHUNK_SECONDS", "8"))
+DEFAULT_CHUNK_SECONDS = float(os.environ.get("VIDEOLINK_CHUNK_SECONDS", "2.5"))
 IINA_SEEK_THRESHOLD_SECONDS = float(os.environ.get("VIDEOLINK_SEEK_THRESHOLD_SECONDS", "8"))
 DEFAULT_IINA_PREROLL_SECONDS = float(os.environ.get("VIDEOLINK_SUBTITLE_PREROLL_SECONDS", "0.75"))
 IINA_BEHIND_RESYNC_SECONDS = float(os.environ.get("VIDEOLINK_BEHIND_RESYNC_SECONDS", "3.0"))
@@ -777,7 +777,7 @@ class StartSubtitleRequest(BaseModel):
     iina_ipc_path: str | None = None
     srt_path: str | None = None
     start_offset_seconds: float = Field(default=0.0, ge=0.0)
-    chunk_seconds: float = Field(default=2.5, ge=2.0, le=30.0) # Changed default to 2.5
+    chunk_seconds: float = Field(default=DEFAULT_CHUNK_SECONDS, ge=1.0, le=30.0)
     sync_to_iina: bool = True
     iina_preroll_seconds: float = Field(default=DEFAULT_IINA_PREROLL_SECONDS, ge=0.0, le=10.0)
 

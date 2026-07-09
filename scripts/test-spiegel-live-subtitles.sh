@@ -3,6 +3,8 @@ set -euo pipefail
 
 SPIEGEL_URL="https://www.spiegel.de/ausland/spiegel-tv-vom-29-06-2026-jugendgangs-in-frankreich-a-a9b769e3-8b11-4b9b-899a-9cdcf708aee3"
 PORT="${VIDEOLINK_SUBTITLE_PORT:-8765}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 echo "=== Spiegel Live Subtitles Proof-Point Test ==="
 echo "Verifying subtitle service health..."
@@ -15,9 +17,9 @@ echo "Service is healthy."
 
 echo "Starting videolink.py workflow in background..."
 echo "Please click 'Live subtitles' when prompted."
-source "/Users/neilllaryea/Workspace/Video script/.venv/bin/activate"
+source "${REPO_DIR}/.venv/bin/activate"
 
-python3 videolink.py --subtitles live "$SPIEGEL_URL" &
+python3 "${REPO_DIR}/videolink.py" --subtitles live "$SPIEGEL_URL" &
 PID=$!
 
 echo "Waiting for session to be registered..."

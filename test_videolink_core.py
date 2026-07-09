@@ -174,6 +174,35 @@ class VideoLinkCoreTests(unittest.TestCase):
         self.assertEqual(payload["iina_ipc_path"], "/tmp/vl-test.sock")
         self.assertEqual(payload["mode"], "live")
 
+    def test_create_live_session_uses_supplied_iina_socket(self) -> None:
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append((request, timeout))
+            return FakeResponse({"id": "session-1", "ipc_socket_path": "/tmp/vl-supplied.sock"})
+
+        with (
+            mock.patch.object(videolink, "SUBTITLE_SERVICE_URL", "http://127.0.0.1:8765"),
+            mock.patch.object(
+                videolink,
+                "make_iina_ipc_path",
+                side_effect=AssertionError("caller supplied the socket path"),
+            ),
+            mock.patch.object(videolink, "urlopen", side_effect=fake_urlopen),
+        ):
+            session, error = videolink.create_live_subtitle_session(
+                "https://cdn.example.com/video.m3u8",
+                "Example",
+                "auto",
+                "small",
+                ipc_path="/tmp/vl-supplied.sock",
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(session["id"], "session-1")
+        payload = json.loads(requests[0][0].data.decode("utf-8"))
+        self.assertEqual(payload["iina_ipc_path"], "/tmp/vl-supplied.sock")
+
     def test_start_live_session_reports_success(self) -> None:
         requests = []
 
@@ -737,6 +766,49 @@ class LiveFlowTests(unittest.TestCase):
         self.assertEqual(streams.audio_url, "https://a.example/a")
         self.assertLess(waited, 0.1, "resolution must already be done after dialog time")
 
+    def test_live_auto_launches_iina_before_slow_stream_resolution(self) -> None:
+        """Main KPI: video playback must not wait for subtitle stream resolution."""
+        events: list[tuple] = []
+
+        def wait_for_streams(timeout_seconds=None):
+            events.append(("wait_streams", timeout_seconds))
+            if timeout_seconds is not None:
+                return None
+            return videolink.StreamSelection("https://d.example/v", "https://a.example/a")
+
+        def fake_open(url, ipc_path=None, audio_url=None):
+            events.append(("open", url, ipc_path, audio_url))
+            return True
+
+        def fake_create(media_url, title, language, model, ipc_path=None):
+            events.append(("create_session", media_url, ipc_path))
+            return {"id": "s1", "ipc_socket_path": ipc_path}, None
+
+        def fake_start(session_id):
+            events.append(("start_session", session_id))
+            return True, None
+
+        with (
+            mock.patch.object(videolink.sys, "argv",
+                              ["videolink.py", "--subtitle-auto", "https://news.example.com/story"]),
+            mock.patch.object(videolink, "extract_with_timeout",
+                              return_value=([("Clip", "https://x.example/watch")], "fast-path", None)),
+            mock.patch.object(videolink, "copy_to_clipboard", return_value=True),
+            mock.patch.object(videolink, "begin_stream_resolution", return_value=wait_for_streams),
+            mock.patch.object(videolink, "make_iina_ipc_path", return_value="/tmp/vl-fast.sock"),
+            mock.patch.object(videolink, "open_in_iina", side_effect=fake_open),
+            mock.patch.object(videolink, "create_live_subtitle_session", side_effect=fake_create),
+            mock.patch.object(videolink, "start_live_subtitle_session", side_effect=fake_start),
+            mock.patch.object(videolink, "notify"),
+        ):
+            videolink.main()
+
+        self.assertEqual(events[0], ("wait_streams", videolink.PLAYBACK_STREAM_GRACE_SECONDS))
+        self.assertEqual(events[1], ("open", "https://x.example/watch", "/tmp/vl-fast.sock", None))
+        self.assertEqual(events[2], ("wait_streams", None))
+        self.assertEqual(events[3], ("create_session", "https://a.example/a", "/tmp/vl-fast.sock"))
+        self.assertEqual(events[4], ("start_session", "s1"))
+
     def test_subtitles_flag_is_validated(self) -> None:
         with self.assertRaises(SystemExit) as caught:
             videolink.parse_args(["--subtitles", "compile"])
@@ -776,12 +848,14 @@ class LiveFlowTests(unittest.TestCase):
         self.assertNotIn("Compile", scripts[0], "the compile option was a no-op and must stay gone")
 
     def test_live_mode_with_broken_session_response_asks_instead_of_crashing(self) -> None:
-        """A session dict missing ipc_socket_path used to raise KeyError."""
-        asked: list[str] = []
+        """A session dict missing ipc_socket_path used to raise KeyError.
 
-        def fake_ask(detail: str) -> bool:
-            asked.append(detail)
-            return False  # user declines the no-subtitles fallback
+        Video is now opened before subtitle session setup, so the failure path
+        reports subtitle failure instead of asking whether to open fallback
+        playback.
+        """
+        opened: list[str] = []
+        notifications: list[str] = []
 
         with (
             mock.patch.object(videolink.sys, "argv",
@@ -790,18 +864,20 @@ class LiveFlowTests(unittest.TestCase):
                               return_value=([("Clip", "https://x.example/clip")], "primary", None)),
             mock.patch.object(videolink, "copy_to_clipboard", return_value=True),
             mock.patch.object(videolink, "begin_stream_resolution",
-                              return_value=lambda: videolink.StreamSelection(
+                              return_value=lambda timeout_seconds=None: videolink.StreamSelection(
                                   "https://d.example/v", "https://a.example/a")),
             mock.patch.object(videolink, "create_live_subtitle_session",
                               return_value=({"id": "s1"}, None)),  # no ipc_socket_path
-            mock.patch.object(videolink, "ask_open_without_subtitles", side_effect=fake_ask),
+            mock.patch.object(videolink, "make_iina_ipc_path", return_value="/tmp/vl-test.sock"),
             mock.patch.object(videolink, "open_in_iina",
-                              side_effect=AssertionError("must not open without consent")),
-            mock.patch.object(videolink, "notify"),
+                              side_effect=lambda url, **kwargs: opened.append(url) or True),
+            mock.patch.object(videolink, "notify",
+                              side_effect=lambda message, title="Video Link": notifications.append(message)),
         ):
             videolink.main()
 
-        self.assertEqual(len(asked), 1)
+        self.assertEqual(opened, ["https://d.example/v"])
+        self.assertTrue(any("couldn't start live subtitles" in item for item in notifications))
 
 
 class SubtitleServiceStatusTests(unittest.TestCase):
@@ -875,6 +951,11 @@ class SubtitleServiceStatusTests(unittest.TestCase):
         self.assertEqual(payload["state"], "running")
         self.assertEqual(payload["session_id"], "running-session")
         self.assertEqual(payload["media_url"], "https://cdn.example.com/video.m3u8")
+
+    def test_chunk_seconds_default_uses_environment_backed_constant(self) -> None:
+        service = self.service
+        request = service.StartSubtitleRequest(media_url="https://cdn.example.com/video.m3u8")
+        self.assertEqual(request.chunk_seconds, service.DEFAULT_CHUNK_SECONDS)
 
 
 if __name__ == "__main__":

@@ -92,6 +92,13 @@ EXTRACT_TIMEOUT_SECONDS = 12
 # instead of the ~44s the old per-stage defaults added up to.
 LIVE_RESOLVE_TIMEOUT_SECONDS = 10
 SESSION_CREATE_TIMEOUT_SECONDS = 8
+# Live subtitle mode should not block actual playback on secondary stream
+# resolution. Give already-fast cache/direct-media paths a tiny chance to win,
+# then open IINA and let subtitle setup continue behind playback.
+PLAYBACK_STREAM_GRACE_SECONDS = float(os.environ.get(
+    "VIDEOLINK_PLAYBACK_STREAM_GRACE_SECONDS",
+    "0.2",
+))
 
 # One HTML fetch may only consume a short slice of the overall budget, so the
 # candidate probes and the generic last resort still have time to run.
@@ -581,8 +588,13 @@ def begin_stream_resolution(url: str, cookies_browser: str | None):
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
-    def wait() -> StreamSelection | None:
-        thread.join(deadline.remaining() + 2.0)
+    def wait(timeout_seconds: float | None = None) -> StreamSelection | None:
+        join_for = (
+            deadline.remaining() + 2.0
+            if timeout_seconds is None
+            else max(0.0, timeout_seconds)
+        )
+        thread.join(join_for)
         return result.get("streams") if not thread.is_alive() else None
 
     return wait
@@ -981,9 +993,16 @@ def resolve_subtitle_mode(args, title: str) -> str | None:
     return "none"
 
 
-def create_live_subtitle_session(media_url: str, title: str, language: str, model: str) -> tuple[dict | None, str | None]:
-    # Generate the IPC socket path here (in /tmp - see make_iina_ipc_path)
-    # rather than letting the server default one from its own environment.
+def create_live_subtitle_session(
+    media_url: str,
+    title: str,
+    language: str,
+    model: str,
+    ipc_path: str | None = None,
+) -> tuple[dict | None, str | None]:
+    # Generate or accept the IPC socket path here (in /tmp - see
+    # make_iina_ipc_path) rather than letting the server default one from its
+    # own environment.
     # The server's own tempfile.gettempdir() fallback is fine as long as the
     # server process itself isn't sandboxed, but supplying our own keeps the
     # guarantee explicit regardless of how/where the service happens to run.
@@ -993,7 +1012,7 @@ def create_live_subtitle_session(media_url: str, title: str, language: str, mode
         "language": language,
         "model": model,
         "mode": "live",
-        "iina_ipc_path": make_iina_ipc_path(),
+        "iina_ipc_path": ipc_path or make_iina_ipc_path(),
     }).encode("utf-8")
     request = Request(
         f"{SUBTITLE_SERVICE_URL}/sessions",
@@ -1140,36 +1159,43 @@ def main() -> None:
 
     opened = False
     if subtitle_mode == "live":
-        streams = wait_for_streams() if wait_for_streams else None
-        mark_timing("streams resolved" if streams else "stream resolution failed")
+        streams = wait_for_streams(PLAYBACK_STREAM_GRACE_SECONDS) if wait_for_streams else None
         if streams:
             display_url = streams.display_url
             audio_url = streams.audio_url
             iina_audio_url = streams.iina_audio_url
+            mark_timing("streams ready before IINA launch")
         else:
             display_url = audio_url = chosen
             iina_audio_url = None
-        session, session_error = create_live_subtitle_session(
-            media_url=audio_url,
-            title=title,
-            language=args.subtitle_language,
-            model=args.subtitle_model
-        )
-        # Guard the response shape too: a session without an id or socket
-        # path is as unusable as no session, and must not crash the hotkey.
-        ipc_socket_path = (session or {}).get("ipc_socket_path")
-        session_id = (session or {}).get("id")
-        if not ipc_socket_path or not session_id:
-            detail = session_error or "service response missing session id or IPC socket path"
-            if ask_open_without_subtitles(detail):
-                opened = open_in_iina(chosen)
-            else:
+
+        ipc_socket_path = make_iina_ipc_path()
+        opened = open_in_iina(display_url, ipc_path=ipc_socket_path, audio_url=iina_audio_url)
+        mark_timing("IINA launched" if opened else "IINA launch failed")
+        if opened:
+            if streams is None and wait_for_streams:
+                streams = wait_for_streams()
+                mark_timing("streams resolved after IINA launch" if streams else "stream resolution failed")
+                if streams:
+                    audio_url = streams.audio_url
+
+            session, session_error = create_live_subtitle_session(
+                media_url=audio_url,
+                title=title,
+                language=args.subtitle_language,
+                model=args.subtitle_model,
+                ipc_path=ipc_socket_path,
+            )
+            # Guard the response shape too: a session without an id or socket
+            # path is as unusable as no session, and must not crash the hotkey.
+            returned_ipc_socket_path = (session or {}).get("ipc_socket_path")
+            session_id = (session or {}).get("id")
+            if not returned_ipc_socket_path or not session_id:
+                detail = session_error or "service response missing session id or IPC socket path"
+                notify(f"Opened in IINA, but couldn't start live subtitles: {detail}")
                 return
-        else:
-            mark_timing("subtitle session created")
-            opened = open_in_iina(display_url, ipc_path=ipc_socket_path, audio_url=iina_audio_url)
-            mark_timing("IINA launched" if opened else "IINA launch failed")
-            if opened:
+            else:
+                mark_timing("subtitle session created")
                 started, start_error = start_live_subtitle_session(session_id)
                 mark_timing("live subtitles started")
                 if not started:
@@ -1179,8 +1205,6 @@ def main() -> None:
                         f"{start_error or 'Unknown error'}"
                     )
                     return
-            else:
-                stop_subtitle_session(session_id)
     else:
         opened = open_in_iina(chosen)
 
