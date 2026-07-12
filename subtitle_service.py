@@ -52,7 +52,11 @@ SUBTITLE_OUTPUT_DIR = Path(os.environ.get(
 SAMPLE_RATE = 16000
 BYTES_PER_PCM_SECOND = SAMPLE_RATE * 2
 DEFAULT_CHUNK_SECONDS = float(os.environ.get("VIDEOLINK_CHUNK_SECONDS", "2.5"))
-IINA_SEEK_THRESHOLD_SECONDS = float(os.environ.get("VIDEOLINK_SEEK_THRESHOLD_SECONDS", "8"))
+IINA_SEEK_THRESHOLD_SECONDS = float(os.environ.get("VIDEOLINK_SEEK_THRESHOLD_SECONDS", "2.5"))
+# Playback position never decreases on its own, so even a small backwards jump
+# is a real seek - the rewind threshold only needs to absorb IPC read jitter.
+IINA_REWIND_THRESHOLD_SECONDS = float(os.environ.get("VIDEOLINK_REWIND_THRESHOLD_SECONDS", "2.0"))
+IINA_SEEK_POLL_SECONDS = float(os.environ.get("VIDEOLINK_SEEK_POLL_SECONDS", "0.5"))
 DEFAULT_IINA_PREROLL_SECONDS = float(os.environ.get("VIDEOLINK_SUBTITLE_PREROLL_SECONDS", "0.75"))
 IINA_BEHIND_RESYNC_SECONDS = float(os.environ.get("VIDEOLINK_BEHIND_RESYNC_SECONDS", "3.0"))
 SUPPORTED_MODELS = ("tiny", "base", "small", "medium")
@@ -809,6 +813,51 @@ def renumber_captions(captions: list[CaptionCue]) -> None:
         cue.index = index
 
 
+COVERAGE_SLACK_SECONDS = 0.5
+
+
+def mark_covered(ranges: list[list[float]], start: float, end: float) -> None:
+    """Record [start, end] as transcribed, merging into overlapping ranges.
+
+    The slack bridges the sub-second gaps left between chunks by float
+    rounding, so uninterrupted playback collapses into a single range.
+    """
+    if end <= start:
+        return
+    merged = [start, end]
+    kept: list[list[float]] = []
+    for existing in ranges:
+        touches = (
+            existing[0] <= merged[1] + COVERAGE_SLACK_SECONDS
+            and merged[0] <= existing[1] + COVERAGE_SLACK_SECONDS
+        )
+        if touches:
+            merged = [min(existing[0], merged[0]), max(existing[1], merged[1])]
+        else:
+            kept.append(existing)
+    kept.append(merged)
+    kept.sort(key=lambda item: item[0])
+    ranges[:] = kept
+
+
+def range_is_covered(ranges: list[list[float]], start: float, end: float) -> bool:
+    check_start, check_end = sorted((start, end))
+    return any(
+        item[0] <= check_start + COVERAGE_SLACK_SECONDS
+        and check_end <= item[1] + COVERAGE_SLACK_SECONDS
+        for item in ranges
+    )
+
+
+def truncate_coverage(ranges: list[list[float]], position: float) -> None:
+    kept: list[list[float]] = []
+    for item in ranges:
+        if item[0] >= position:
+            continue
+        kept.append([item[0], min(item[1], position)])
+    ranges[:] = kept
+
+
 @dataclass
 class SubtitleSession:
     id: str
@@ -840,6 +889,14 @@ class SubtitleSession:
     last_iina_position: float | None = None
     iina_failures_after_active: int = 0
     iina_subtitle_track_added: bool = False
+    # Merged [start, end] media-time intervals that have already been
+    # transcribed. Seeks landing inside coverage don't need a pipeline restart:
+    # the SRT already holds cues for that region.
+    covered_ranges: list[list[float]] = field(default_factory=list)
+    behind_polls: int = 0
+    # True while perform_seek tears down the pipeline for a restart, so the
+    # pipeline's cleanup knows not to unload the ASR model.
+    restarting: bool = False
 
     processed_until: float = 0.0
     latency_seconds: float | None = None
@@ -1275,6 +1332,15 @@ def asr_worker_thread(session: SubtitleSession, start_offset: float):
         process_asr_chunk(session, chunk)
         process_end = time.time()
 
+        with SESSION_LOCK:
+            # Silent/rejected chunks count too: the audio was processed and
+            # simply produced no cue, so a seek back here needs no restart.
+            mark_covered(
+                session.covered_ranges,
+                chunk.start_seconds,
+                chunk.start_seconds + chunk.duration,
+            )
+
         processed_duration += chunk.duration
         session.cursor_seconds = chunk.start_seconds + chunk.duration
         session.processed_until = session.cursor_seconds
@@ -1388,32 +1454,58 @@ def detect_seek_or_stop(session: SubtitleSession) -> float | None:
 
     previous = session.last_iina_position
     session.last_iina_position = position
+    target = max(0.0, position - session.request.iina_preroll_seconds)
 
     if position > session.cursor_seconds + IINA_BEHIND_RESYNC_SECONDS:
         # Pipeline fell behind (ASR slower than real-time); catch up to live.
-        return max(0.0, position - session.request.iina_preroll_seconds)
+        # Playback can transiently overshoot the cursor while a chunk is
+        # mid-transcription, so require two consecutive behind polls before
+        # tearing the pipeline down for a restart.
+        session.behind_polls += 1
+        if session.behind_polls >= 2:
+            session.behind_polls = 0
+            return target
+        return None
+    session.behind_polls = 0
     if previous is None:
         return None
-    if position < previous - IINA_SEEK_THRESHOLD_SECONDS:
+    if position < previous - IINA_REWIND_THRESHOLD_SECONDS:
         # Rewound.
-        return max(0.0, position - session.request.iina_preroll_seconds)
+        return target
     if position > previous + session.request.chunk_seconds + IINA_SEEK_THRESHOLD_SECONDS:
         # Jumped forward.
-        return max(0.0, position - session.request.iina_preroll_seconds)
+        return target
     return None
+
+
+def seek_target_is_covered(session: SubtitleSession, position: float) -> bool:
+    """True when everything between the seek target and the live transcription
+    edge is already transcribed - the SRT can serve the seek without a restart.
+    A target past the cursor is never covered (coverage never outruns the
+    cursor, because restarts truncate coverage at their start offset).
+    """
+    with SESSION_LOCK:
+        return range_is_covered(session.covered_ranges, position, session.cursor_seconds)
 
 
 def seek_watcher_thread(session: SubtitleSession) -> None:
     if not session.ipc_socket_path:
         return
     while not session.cancel_event.is_set():
-        time.sleep(1.5)
+        time.sleep(IINA_SEEK_POLL_SECONDS)
         if session.cancel_event.is_set():
             break
         if session.state not in ("starting", "running"):
             continue
         seek_to = detect_seek_or_stop(session)
         if seek_to is None or session.cancel_event.is_set():
+            continue
+        if seek_target_is_covered(session, seek_to):
+            # The seek landed inside already-transcribed audio. The SRT still
+            # holds every cue between here and the live transcription edge, so
+            # IINA renders them instantly; restarting would delete those cues
+            # and open a caption gap while the region is re-transcribed.
+            queue_event(session, "seek_within_transcribed", position_seconds=seek_to)
             continue
         queue_event(session, "seek_detected", position_seconds=seek_to)
         perform_seek(session.id, seek_to)
@@ -1438,6 +1530,11 @@ def run_caption_pipeline(session: SubtitleSession) -> None:
     process: subprocess.Popen[bytes] | None = None
     try:
         start_offset = resolve_initial_start_offset(session)
+        # asr_worker_thread measures latency as wall-time-since-start minus
+        # media-time-since-start-offset. After a seek restart both clocks must
+        # restart together, or the stale-audio dropper reads the entire
+        # pre-seek playback as latency and drains every queued chunk.
+        session.start_time = time.time()
         session.cursor_seconds = start_offset
         write_srt(session.captions, session.srt_path)
         queue_event(
@@ -1489,7 +1586,11 @@ def run_caption_pipeline(session: SubtitleSession) -> None:
     finally:
         session.cancel_event.set()
         terminate_process(process or session.ffmpeg_process)
-        session.backend.close()
+        if not session.restarting:
+            # A seek restart reuses this backend; unloading the Whisper model
+            # here would add seconds of reload time before the first
+            # post-seek caption.
+            session.backend.close()
 
 def stop_session(session: SubtitleSession | None) -> None:
     if session is None:
@@ -1613,37 +1714,58 @@ def perform_seek(session_id: str, position_seconds: float) -> dict[str, Any]:
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    stop_session(session)
-    # run_caption_pipeline's own wait loop exits as soon as cancel_event is
-    # set, without waiting for its worker threads - so joining only
-    # pipeline_task lets this proceed to truncate/rewrite the SRT file while
-    # asr_worker_thread (or the old renderer/seek-watcher) may still be
-    # mid-chunk. Join every worker explicitly so the old generation is fully
-    # stopped before anything below touches shared session state. perform_seek
-    # can itself be called from seek_watcher_thread, so skip joining whichever
-    # thread is currently running this code - Thread.join() on the calling
-    # thread raises RuntimeError.
-    current_thread = threading.current_thread()
-    for worker in (session.pipeline_task, session.ffmpeg_thread, session.asr_task,
-                   session.renderer_task, session.seek_watcher_task):
-        if worker and worker is not current_thread and worker.is_alive():
-            worker.join(timeout=5.0)
+    session.restarting = True
+    try:
+        stop_session(session)
+        # run_caption_pipeline's own wait loop exits as soon as cancel_event is
+        # set, without waiting for its worker threads - so joining only
+        # pipeline_task lets this proceed to truncate/rewrite the SRT file while
+        # asr_worker_thread (or the old renderer/seek-watcher) may still be
+        # mid-chunk. Join every worker explicitly so the old generation is fully
+        # stopped before anything below touches shared session state. perform_seek
+        # can itself be called from seek_watcher_thread, so skip joining whichever
+        # thread is currently running this code - Thread.join() on the calling
+        # thread raises RuntimeError.
+        current_thread = threading.current_thread()
+        for worker in (session.pipeline_task, session.ffmpeg_thread, session.asr_task,
+                       session.renderer_task, session.seek_watcher_task):
+            if worker and worker is not current_thread and worker.is_alive():
+                # These workers share the session's queues, cancel event, SRT,
+                # and ASR backend. Reusing any of them while an old worker is
+                # still alive creates a cross-generation race, so teardown must
+                # complete before the restart clears cancel_event.
+                worker.join()
 
-    session.request.start_offset_seconds = position_seconds
-    session.cursor_seconds = position_seconds
-    session.processed_until = position_seconds
-    session.captions = [cue for cue in session.captions if cue.start < position_seconds]
-    renumber_captions(session.captions)
-    write_srt(session.captions, session.srt_path)
-    if session.iina_subtitle_track_added:
-        reload_iina_subtitle_track(session.ipc_socket_path)
-    session.audio_queue = queue.Queue(maxsize=50)
-    session.render_queue = queue.Queue()
-    session.iina_subtitle_track_added = False
-    session.iina_rendering_active = False
-    session.first_rendered_caption_at = None
-    session.last_iina_position = None
-    session.cancel_event.clear()
+        session.request.start_offset_seconds = position_seconds
+        session.cursor_seconds = position_seconds
+        session.processed_until = position_seconds
+        session.captions = [cue for cue in session.captions if cue.start < position_seconds]
+        renumber_captions(session.captions)
+        truncate_coverage(session.covered_ranges, position_seconds)
+        # The first post-seek chunk is not contiguous with the pre-seek text;
+        # letting remove_overlap compare against it can silently strip
+        # legitimate leading words from the first caption after the seek.
+        session.last_transcription_text = ""
+        write_srt(session.captions, session.srt_path)
+        if session.iina_subtitle_track_added:
+            # Keep the existing "Live captions" track (same SRT path, same IINA
+            # window) - re-adding after every seek stacks duplicate subtitle
+            # tracks in IINA. The renderer keeps using sub-reload.
+            response = reload_iina_subtitle_track(session.ipc_socket_path)
+            if not iina_command_succeeded(response):
+                # The player may have dropped the track while the pipeline was
+                # restarting. Let renderer_thread recover with sub-add instead
+                # of retrying sub-reload forever against a missing track.
+                session.iina_subtitle_track_added = False
+        session.audio_queue = queue.Queue(maxsize=50)
+        session.render_queue = queue.Queue()
+        session.iina_rendering_active = False
+        session.first_rendered_caption_at = None
+        session.last_iina_position = None
+        session.behind_polls = 0
+        session.cancel_event.clear()
+    finally:
+        session.restarting = False
 
     return start_session(session_id)
 

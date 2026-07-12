@@ -1188,6 +1188,277 @@ class ClipboardTests(unittest.TestCase):
 
         self.assertEqual(value, "https://example.com/video")
         self.assertEqual(calls, [["xsel", "--clipboard", "--output"]])
+class SubtitleSeekBehaviorTests(unittest.TestCase):
+    """Fast-forward / rewind handling in the live caption pipeline."""
+
+    def setUp(self) -> None:
+        try:
+            self.service = importlib.import_module("subtitle_service")
+        except (ModuleNotFoundError, SystemExit) as error:
+            self.skipTest(f"subtitle service dependencies unavailable: {error}")
+
+    def tearDown(self) -> None:
+        if not hasattr(self, "service"):
+            return
+        with self.service.SESSION_LOCK:
+            self.service.SESSIONS.clear()
+
+    def make_session(self, **overrides):
+        service = self.service
+
+        class FakeBackend:
+            name = "mock"
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        session = service.SubtitleSession(
+            id="seek-session",
+            request=service.StartSubtitleRequest(media_url="https://cdn.example.com/video.m3u8"),
+            backend=FakeBackend(),
+            backend_info=service.BackendInfo(
+                name="mock",
+                device="test",
+                model="small",
+                acceleration_active=False,
+                available=True,
+            ),
+            srt_path="/tmp/videolink-seek-test.srt",
+            state="running",
+            ipc_socket_path="/tmp/videolink-seek-test.sock",
+        )
+        for key, value in overrides.items():
+            setattr(session, key, value)
+        return session
+
+    def test_small_rewind_is_detected(self) -> None:
+        """IINA's default arrow-key seek is 5s; the old 8s threshold missed it."""
+        session = self.make_session(cursor_seconds=101.0, last_iina_position=100.0)
+        with mock.patch.object(self.service, "iina_time_position", return_value=95.0):
+            seek_to = self.service.detect_seek_or_stop(session)
+        self.assertIsNotNone(seek_to)
+        self.assertAlmostEqual(seek_to, 95.0 - session.request.iina_preroll_seconds)
+
+    def test_small_forward_jump_is_detected(self) -> None:
+        session = self.make_session(cursor_seconds=120.0, last_iina_position=100.0)
+        with mock.patch.object(self.service, "iina_time_position", return_value=106.0):
+            seek_to = self.service.detect_seek_or_stop(session)
+        self.assertIsNotNone(seek_to)
+        self.assertAlmostEqual(seek_to, 106.0 - session.request.iina_preroll_seconds)
+
+    def test_normal_playback_does_not_look_like_a_seek(self) -> None:
+        session = self.make_session(cursor_seconds=103.0, last_iina_position=100.0)
+        with mock.patch.object(self.service, "iina_time_position", return_value=100.8):
+            self.assertIsNone(self.service.detect_seek_or_stop(session))
+
+    def test_behind_resync_needs_two_consecutive_polls(self) -> None:
+        session = self.make_session(cursor_seconds=100.0, last_iina_position=99.0)
+        with mock.patch.object(
+            self.service, "iina_time_position", side_effect=[104.0, 105.0]
+        ):
+            self.assertIsNone(self.service.detect_seek_or_stop(session))
+            seek_to = self.service.detect_seek_or_stop(session)
+        self.assertAlmostEqual(seek_to, 105.0 - session.request.iina_preroll_seconds)
+
+    def test_transient_behind_overshoot_does_not_restart(self) -> None:
+        session = self.make_session(cursor_seconds=100.0, last_iina_position=99.0)
+        with mock.patch.object(
+            self.service, "iina_time_position", side_effect=[104.0, 104.5]
+        ):
+            self.assertIsNone(self.service.detect_seek_or_stop(session))
+            session.cursor_seconds = 105.0  # chunk finished; pipeline caught up
+            self.assertIsNone(self.service.detect_seek_or_stop(session))
+        self.assertEqual(session.behind_polls, 0)
+
+    def test_coverage_merges_contiguous_chunks(self) -> None:
+        service = self.service
+        ranges: list[list[float]] = []
+        service.mark_covered(ranges, 10.0, 12.5)
+        service.mark_covered(ranges, 12.5, 15.0)
+        service.mark_covered(ranges, 15.1, 17.5)  # sub-second float gap bridged
+        service.mark_covered(ranges, 300.0, 302.5)  # disjoint after a jump
+        self.assertEqual(len(ranges), 2)
+        self.assertTrue(service.range_is_covered(ranges, 11.0, 17.0))
+        self.assertFalse(service.range_is_covered(ranges, 11.0, 40.0))
+        self.assertFalse(service.range_is_covered(ranges, 100.0, 110.0))
+
+    def test_seek_target_coverage_check(self) -> None:
+        session = self.make_session(cursor_seconds=120.0, covered_ranges=[[10.0, 120.0]])
+        self.assertTrue(self.service.seek_target_is_covered(session, 40.0))
+        self.assertFalse(self.service.seek_target_is_covered(session, 5.0))
+        self.assertFalse(self.service.seek_target_is_covered(session, 150.0))
+
+    def test_seek_watcher_skips_restart_for_covered_target(self) -> None:
+        service = self.service
+        session = self.make_session(cursor_seconds=120.0, covered_ranges=[[10.0, 120.0]])
+        performed: list[float] = []
+        polls = {"count": 0}
+
+        def fake_detect(sess):
+            polls["count"] += 1
+            if polls["count"] == 1:
+                return 40.0  # rewind into transcribed audio
+            sess.cancel_event.set()
+            return None
+
+        with (
+            mock.patch.object(service, "IINA_SEEK_POLL_SECONDS", 0.01),
+            mock.patch.object(service, "detect_seek_or_stop", side_effect=fake_detect),
+            mock.patch.object(
+                service, "perform_seek",
+                side_effect=lambda sid, pos: performed.append(pos),
+            ),
+        ):
+            service.seek_watcher_thread(session)
+
+        self.assertEqual(performed, [], "covered rewind must not restart the pipeline")
+        self.assertGreaterEqual(polls["count"], 2, "watcher must keep polling after a covered seek")
+
+    def test_seek_watcher_restarts_for_uncovered_target(self) -> None:
+        service = self.service
+        session = self.make_session(cursor_seconds=120.0, covered_ranges=[[100.0, 120.0]])
+        performed: list[tuple[str, float]] = []
+        with (
+            mock.patch.object(service, "IINA_SEEK_POLL_SECONDS", 0.01),
+            mock.patch.object(service, "detect_seek_or_stop", return_value=40.0),
+            mock.patch.object(
+                service, "perform_seek",
+                side_effect=lambda sid, pos: performed.append((sid, pos)),
+            ),
+        ):
+            service.seek_watcher_thread(session)
+        self.assertEqual(performed, [(session.id, 40.0)])
+
+    def test_perform_seek_resets_transcription_context(self) -> None:
+        service = self.service
+        session = self.make_session(
+            cursor_seconds=120.0,
+            covered_ranges=[[10.0, 120.0]],
+            last_transcription_text="text from before the seek",
+            iina_subtitle_track_added=True,
+        )
+        session.captions = [
+            service.CaptionCue(index=1, start=20.0, end=22.0, text="keep"),
+            service.CaptionCue(index=2, start=80.0, end=82.0, text="drop"),
+        ]
+        with service.SESSION_LOCK:
+            service.SESSIONS[session.id] = session
+
+        reloads: list[str] = []
+        with (
+            mock.patch.object(service, "write_srt"),
+            mock.patch.object(
+                service, "reload_iina_subtitle_track",
+                side_effect=lambda path: reloads.append(path) or {"error": "success"},
+            ),
+            mock.patch.object(service, "start_session", return_value={"state": "starting"}),
+        ):
+            service.perform_seek(session.id, 50.0)
+
+        self.assertEqual([cue.text for cue in session.captions], ["keep"])
+        self.assertEqual(session.covered_ranges, [[10.0, 50.0]])
+        self.assertEqual(session.last_transcription_text, "")
+        self.assertTrue(
+            session.iina_subtitle_track_added,
+            "seek must not force a duplicate sub-add of the same SRT track",
+        )
+        self.assertEqual(reloads, [session.ipc_socket_path])
+        self.assertFalse(session.restarting)
+        self.assertFalse(session.cancel_event.is_set())
+        self.assertFalse(session.backend.closed)
+
+    def test_perform_seek_waits_for_old_workers_before_reusing_state(self) -> None:
+        service = self.service
+        session = self.make_session()
+
+        class FinishingWorker:
+            def __init__(self) -> None:
+                self.alive = True
+                self.join_timeout = "not-called"
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def join(self, timeout=None) -> None:
+                self.join_timeout = timeout
+                self.alive = False
+
+        worker = FinishingWorker()
+        session.asr_task = worker
+        with service.SESSION_LOCK:
+            service.SESSIONS[session.id] = session
+
+        with (
+            mock.patch.object(service, "write_srt"),
+            mock.patch.object(service, "start_session", return_value={"state": "starting"}),
+        ):
+            service.perform_seek(session.id, 50.0)
+
+        self.assertIsNone(
+            worker.join_timeout,
+            "seek restart must not reuse shared state after a timed-out worker join",
+        )
+
+    def test_perform_seek_readds_track_when_reload_fails(self) -> None:
+        service = self.service
+        session = self.make_session(iina_subtitle_track_added=True)
+        with service.SESSION_LOCK:
+            service.SESSIONS[session.id] = session
+
+        with (
+            mock.patch.object(service, "write_srt"),
+            mock.patch.object(
+                service,
+                "reload_iina_subtitle_track",
+                return_value={"error": "failure", "request_id": 1},
+            ),
+            mock.patch.object(service, "start_session", return_value={"state": "starting"}),
+        ):
+            service.perform_seek(session.id, 50.0)
+
+        self.assertFalse(
+            session.iina_subtitle_track_added,
+            "renderer must fall back to sub-add after a failed seek reload",
+        )
+
+    def test_pipeline_restart_resets_latency_clock_and_keeps_backend(self) -> None:
+        service = self.service
+        session = self.make_session(restarting=True)
+        session.start_time = time.time() - 500.0
+        pipeline_patches = (
+            mock.patch.object(service, "write_srt"),
+            mock.patch.object(service, "resolve_initial_start_offset", return_value=42.0),
+            mock.patch.object(
+                service, "open_ffmpeg_pcm",
+                side_effect=RuntimeError("no ffmpeg in tests"),
+            ),
+        )
+        with pipeline_patches[0], pipeline_patches[1], pipeline_patches[2]:
+            service.run_caption_pipeline(session)
+
+        self.assertLess(
+            time.time() - session.start_time, 60.0,
+            "start_time must reset on restart or the stale-audio dropper "
+            "reads the whole pre-seek playback as latency",
+        )
+        self.assertEqual(session.cursor_seconds, 42.0)
+        self.assertFalse(session.backend.closed, "seek restarts must keep the ASR model loaded")
+
+        session.restarting = False
+        pipeline_patches = (
+            mock.patch.object(service, "write_srt"),
+            mock.patch.object(service, "resolve_initial_start_offset", return_value=42.0),
+            mock.patch.object(
+                service, "open_ffmpeg_pcm",
+                side_effect=RuntimeError("no ffmpeg in tests"),
+            ),
+        )
+        with pipeline_patches[0], pipeline_patches[1], pipeline_patches[2]:
+            service.run_caption_pipeline(session)
+        self.assertTrue(session.backend.closed, "a real stop must still unload the backend")
 
 
 if __name__ == "__main__":
