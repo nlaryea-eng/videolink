@@ -1,8 +1,59 @@
 # VideoLink
 
 VideoLink extracts a video URL from the clipboard or a supplied page URL, opens
-it in IINA, and can optionally hand the selected media URL to a local subtitle
-service.
+it in a player (IINA on macOS, mpv on Linux), and can optionally hand the
+selected media URL to a local subtitle service.
+
+## Platform Support
+
+VideoLink runs on **macOS** (its original target) and **Linux**. The behavior is
+the same on both; only the platform integrations differ, and they are selected
+at runtime:
+
+| Concern            | macOS                              | Linux                               |
+| ------------------ | ---------------------------------- | ----------------------------------- |
+| Player             | IINA                               | mpv (IINA is an mpv GUI frontend)   |
+| Live ASR backend   | MLX (Apple Silicon), faster-whisper (Intel) | faster-whisper (CPU)        |
+| Clipboard          | `pbcopy`/`pbpaste`                 | `wl-copy`/`wl-paste`, `xclip`/`xsel`|
+| Notifications      | `osascript`                        | `notify-send`                       |
+| Data directory     | `~/Library/Application Support/VideoLink` | `~/.local/share/VideoLink` (XDG) |
+
+Because the subtitle service drives the player purely over mpv's JSON IPC
+(`sub-add` / `sub-reload` / `get_property`), and IINA is an mpv frontend, the
+live-subtitle pipeline is identical on both platforms.
+
+The data directory can be overridden anywhere with `VIDEOLINK_APP_SUPPORT_DIR`.
+
+## Quick Start (macOS and Linux)
+
+```sh
+scripts/install.sh
+```
+
+The installer detects your OS, package manager, and existing tools; tells you the
+exact command for any missing system packages (it never runs `sudo` for you);
+creates or reuses a repo-local `.venv`; sets up the subtitle-service environment;
+installs the right ASR backend (faster-whisper on Linux and Intel macOS, MLX on
+Apple Silicon); and finishes by running diagnostics. It is safe to re-run.
+Non-interactive: `scripts/install.sh --yes`.
+
+## Linux Setup
+
+Install the system dependencies (Debian/Ubuntu example):
+
+```sh
+sudo apt-get install -y mpv ffmpeg python3-venv
+```
+
+Then run `scripts/install.sh` (see Quick Start). Manually, the steps are the same
+as the macOS "Fresh Clone Setup" below, except:
+
+- The app-managed venv lives at `~/.local/share/VideoLink/venv`.
+- The default live backend is faster-whisper:
+  `scripts/install-live-backend.sh --backend faster-whisper`.
+- Playback opens in mpv. VideoLink launches `mpv --force-window=yes
+  --input-ipc-server=<sock> <url>`; the subtitle service attaches captions to the
+  same IPC socket exactly as it does with IINA.
 
 ## Recommended MacBook Air M4 Configuration
 

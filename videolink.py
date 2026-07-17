@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Grab a video link from a web page and copy it to the clipboard.
 
-Keybind flow (macOS): copy a page URL, hit your hotkey. This reads the URL
-from the clipboard, asks yt-dlp what videos are on the page, copies the link,
-opens it in IINA (or shows a picker first if there are several), and posts a
-notification.
+Copy a page URL and run the command (directly or from a hotkey). It reads the
+URL from the clipboard, asks yt-dlp what videos are on the page, copies the
+link, opens it in IINA on macOS or mpv on Linux, and posts a notification.
 
 Usage:
     videolink.py [url] [--cookies-from-browser BROWSER] [--html] [--subtitle-prompt|--subtitle-auto]
@@ -15,7 +14,7 @@ If no url is given it reads one from the clipboard.
     browser's login cookies. (--cookies-from is kept as an alias.)
 --html  copy an <a href> anchor tag instead of the plain URL (for rich-text
     targets like email or a CMS).
---subtitle-prompt  offer to open IINA with live subtitles through the local
+--subtitle-prompt  offer to open the player with live subtitles through the local
     subtitle service if it is running.
 --subtitle-auto  start live subtitles automatically (no confirmation dialog)
     when the local subtitle service is running and a backend is available.
@@ -49,6 +48,7 @@ import yt_dlp
 from resolver_core import (
     Deadline,
     StreamSelection,
+    app_support_dir,
     dedupe_videos,
     direct_media_formats,
     discover_embed_candidate_urls,
@@ -94,7 +94,7 @@ LIVE_RESOLVE_TIMEOUT_SECONDS = 10
 SESSION_CREATE_TIMEOUT_SECONDS = 8
 # Live subtitle mode should not block actual playback on secondary stream
 # resolution. Give already-fast cache/direct-media paths a tiny chance to win,
-# then open IINA and let subtitle setup continue behind playback.
+# then open the player and let subtitle setup continue behind playback.
 PLAYBACK_STREAM_GRACE_SECONDS = float(os.environ.get(
     "VIDEOLINK_PLAYBACK_STREAM_GRACE_SECONDS",
     "0.2",
@@ -154,7 +154,12 @@ YDL_OPTS = {
 # --- platform glue (clipboard + notifications, macOS first) ------------------
 
 def read_clipboard() -> str:
-    for command in (["pbpaste"], ["wl-paste"], ["xclip", "-selection", "clipboard", "-o"]):
+    for command in (
+        ["pbpaste"],
+        ["wl-paste", "--no-newline"],
+        ["xclip", "-selection", "clipboard", "-o"],
+        ["xsel", "--clipboard", "--output"],
+    ):
         if shutil.which(command[0]):
             try:
                 return subprocess.run(command, capture_output=True, text=True, check=True).stdout
@@ -175,6 +180,26 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def mpv_command(url: str, mpv_args: list[str]) -> list[str] | None:
+    """Build a plain-mpv launch command, or None if mpv is not on PATH.
+
+    IINA is an mpv GUI frontend, so the subtitle service's IPC commands
+    (sub-add/sub-reload/get_property) work against plain mpv unchanged — this is
+    what makes VideoLink run on Linux. Only two things differ from the IINA CLI:
+    IINA passes mpv options via `--mpv-<name>=`, and its `--separate-windows` is
+    IINA-only (mpv already opens a fresh window per process). Translate the IPC
+    flag back to native mpv and force a window so audio-only URLs still show up.
+    """
+    mpv_path = shutil.which("mpv")
+    if not mpv_path:
+        return None
+    native_args = [
+        "--" + arg[len("--mpv-"):] if arg.startswith("--mpv-") else arg
+        for arg in mpv_args
+    ]
+    return [mpv_path, "--force-window=yes", *native_args, url]
+
+
 def iina_cli_commands(url: str, mpv_args: list[str]) -> list[list[str]]:
     commands = []
     window_args = ["--separate-windows"] if mpv_args else []
@@ -187,12 +212,15 @@ def iina_cli_commands(url: str, mpv_args: list[str]) -> list[list[str]]:
     if sys.platform == "darwin" and os.path.exists(IINA_BUNDLED_CLI):
         commands.append([IINA_BUNDLED_CLI, "--no-stdin", *window_args, *mpv_args, url])
 
+    # Off macOS (and as a fallback anywhere IINA is absent), open in plain mpv.
+    mpv = mpv_command(url, mpv_args)
+    if mpv:
+        commands.append(mpv)
+
     return commands
 
 
-LAST_SUBTITLE_WINDOW_FILE = os.path.join(
-    os.path.expanduser("~/Library/Application Support/VideoLink"), "last_iina_socket.txt"
-)
+LAST_SUBTITLE_WINDOW_FILE = str(app_support_dir() / "last_iina_socket.txt")
 
 
 def close_previous_subtitle_window() -> None:
@@ -221,7 +249,8 @@ def close_previous_subtitle_window() -> None:
         except ValueError:
             continue
         check = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False)
-        if "IINA" not in check.stdout:
+        command_line = check.stdout.lower()
+        if "iina" not in command_line and "mpv" not in command_line:
             continue  # the pid was reused for something else since - don't touch it
         try:
             subprocess.run(["kill", str(pid)], check=False)
@@ -236,6 +265,50 @@ def remember_subtitle_window(ipc_path: str) -> None:
             handle.write(ipc_path)
     except OSError:
         pass
+
+
+# How long to watch a detached mpv for an immediate crash (bad args, missing
+# file) before treating the launch as successful. mpv is a foreground player, so
+# a clean launch simply keeps running; only a fast non-zero exit means failure.
+MPV_LAUNCH_PROBE_SECONDS = 0.2
+
+
+def launch_player_command(command: list[str]) -> bool:
+    """Start one player launch command; return True if it came up.
+
+    IINA's `iina-cli`/`open` hand off to the IINA app and exit immediately, so a
+    zero exit code means success — run them and wait. Plain `mpv`, by contrast,
+    is the foreground player and blocks until the video closes, which would stall
+    VideoLink's resolve→session→IPC flow. Detach mpv into its own session and
+    treat "still running after a short probe" as a successful launch.
+    """
+    if os.path.basename(command[0]) == "mpv":
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            return False
+        try:
+            process.wait(timeout=MPV_LAUNCH_PROBE_SECONDS)
+        except subprocess.TimeoutExpired:
+            return True  # still playing — the normal, healthy case
+        return process.returncode == 0
+
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
 
 
 def open_in_iina(
@@ -257,13 +330,7 @@ def open_in_iina(
         fallback_commands.append(["open", "-a", "IINA", url])
 
     for command in [*commands, *fallback_commands]:
-        try:
-            subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        if launch_player_command(command):
             if ipc_path:
                 # Close the old window only once the new launch has succeeded:
                 # closing first would trade a working video for a failed one
@@ -272,18 +339,24 @@ def open_in_iina(
                 close_previous_subtitle_window()
                 remember_subtitle_window(ipc_path)
             return True
-        except (OSError, subprocess.CalledProcessError):
-            continue
 
     return False
 
 
 def notify(message: str, title: str = "Video Link") -> None:
-    """Post a desktop notification on macOS; fall back to printing."""
+    """Post a desktop notification (macOS or Linux); fall back to printing."""
     if shutil.which("osascript"):
         script = f'display notification {applescript_string(message)} with title {applescript_string(title)}'
         try:
             subprocess.run(["osascript", "-e", script], check=True)
+            return
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    # Linux desktops: libnotify. Pass title/message as plain args so no shell
+    # quoting or AppleScript escaping is involved.
+    if shutil.which("notify-send"):
+        try:
+            subprocess.run(["notify-send", title, message], check=True)
             return
         except (OSError, subprocess.CalledProcessError):
             pass
@@ -1164,18 +1237,18 @@ def main() -> None:
             display_url = streams.display_url
             audio_url = streams.audio_url
             iina_audio_url = streams.iina_audio_url
-            mark_timing("streams ready before IINA launch")
+            mark_timing("streams ready before player launch")
         else:
             display_url = audio_url = chosen
             iina_audio_url = None
 
         ipc_socket_path = make_iina_ipc_path()
         opened = open_in_iina(display_url, ipc_path=ipc_socket_path, audio_url=iina_audio_url)
-        mark_timing("IINA launched" if opened else "IINA launch failed")
+        mark_timing("player launched" if opened else "player launch failed")
         if opened:
             if streams is None and wait_for_streams:
                 streams = wait_for_streams()
-                mark_timing("streams resolved after IINA launch" if streams else "stream resolution failed")
+                mark_timing("streams resolved after player launch" if streams else "stream resolution failed")
                 if streams:
                     audio_url = streams.audio_url
 
@@ -1192,7 +1265,7 @@ def main() -> None:
             session_id = (session or {}).get("id")
             if not returned_ipc_socket_path or not session_id:
                 detail = session_error or "service response missing session id or IPC socket path"
-                notify(f"Opened in IINA, but couldn't start live subtitles: {detail}")
+                notify(f"Opened in the player, but couldn't start live subtitles: {detail}")
                 return
             else:
                 mark_timing("subtitle session created")
@@ -1201,7 +1274,7 @@ def main() -> None:
                 if not started:
                     stop_subtitle_session(session_id)
                     notify(
-                        "Opened in IINA, but couldn't start live subtitles: "
+                        "Opened in the player, but couldn't start live subtitles: "
                         f"{start_error or 'Unknown error'}"
                     )
                     return
@@ -1209,15 +1282,15 @@ def main() -> None:
         opened = open_in_iina(chosen)
 
     if copied and opened:
-        notify(f"Copied {label} and opened in IINA: {short(chosen)}")
+        notify(f"Copied {label} and opened in the player: {short(chosen)}")
     elif copied:
-        notify(f"Copied {label}, but couldn't open IINA: {short(chosen)}")
+        notify(f"Copied {label}, but couldn't open the player: {short(chosen)}")
     elif opened:
         print(payload)
-        notify(f"Opened in IINA, but couldn't reach the clipboard — printed {label}.")
+        notify(f"Opened in the player, but couldn't reach the clipboard — printed {label}.")
     else:
         print(payload)
-        notify(f"Couldn't reach the clipboard or IINA — printed {label} to terminal.")
+        notify(f"Couldn't reach the clipboard or player — printed {label} to terminal.")
 
 
 if __name__ == "__main__":

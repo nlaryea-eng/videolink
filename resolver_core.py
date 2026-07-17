@@ -18,12 +18,40 @@ from __future__ import annotations
 
 import html
 import json
+import os
+import platform
 import re
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import urljoin, urlparse
+
+
+def app_support_dir() -> Path:
+    """Per-user data directory for VideoLink, resolved per operating system.
+
+    macOS keeps its native ``~/Library/Application Support/VideoLink`` so the
+    existing app behaves exactly as before. Everywhere else we follow the XDG
+    base-directory spec (``$XDG_DATA_HOME`` or ``~/.local/share``). The
+    ``VIDEOLINK_APP_SUPPORT_DIR`` override wins on every platform so tests and
+    the installer can point the service and CLI at a scratch location.
+
+    Pure path math only — no filesystem or network side effects — so it stays
+    safe to import from the resolver core and the long-running service alike.
+    """
+    override = os.environ.get("VIDEOLINK_APP_SUPPORT_DIR")
+    if override:
+        return Path(override).expanduser()
+    if platform.system() == "Darwin":
+        return Path.home() / "Library/Application Support/VideoLink"
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    xdg_path = Path(xdg_data_home).expanduser() if xdg_data_home else None
+    # The XDG spec requires an absolute path. Ignore malformed relative values
+    # instead of letting the service's data directory depend on its cwd.
+    base = xdg_path if xdg_path and xdg_path.is_absolute() else Path.home() / ".local/share"
+    return base / "VideoLink"
 
 # Used only by the fallback: some publishers wrap a YouTube or Vimeo video in
 # their own player, so yt-dlp's generic extractor sees no embed. These find

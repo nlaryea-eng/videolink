@@ -958,5 +958,237 @@ class SubtitleServiceStatusTests(unittest.TestCase):
         self.assertEqual(request.chunk_seconds, service.DEFAULT_CHUNK_SECONDS)
 
 
+class AppSupportDirTests(unittest.TestCase):
+    """resolver_core.app_support_dir() resolves per platform (no videolink import)."""
+
+    def test_env_override_wins_on_any_platform(self) -> None:
+        with mock.patch.dict(os.environ, {"VIDEOLINK_APP_SUPPORT_DIR": "/tmp/vl-scratch"}):
+            self.assertEqual(str(resolver_core.app_support_dir()), "/tmp/vl-scratch")
+
+    def test_linux_uses_xdg_data_home(self) -> None:
+        with (
+            mock.patch.object(resolver_core.platform, "system", return_value="Linux"),
+            mock.patch.dict(os.environ, {"XDG_DATA_HOME": "/home/u/.data"}, clear=False),
+        ):
+            os.environ.pop("VIDEOLINK_APP_SUPPORT_DIR", None)
+            self.assertEqual(str(resolver_core.app_support_dir()), "/home/u/.data/VideoLink")
+
+    def test_linux_falls_back_to_local_share(self) -> None:
+        with (
+            mock.patch.object(resolver_core.platform, "system", return_value="Linux"),
+            mock.patch.object(resolver_core.Path, "home", return_value=resolver_core.Path("/home/u")),
+        ):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("VIDEOLINK_APP_SUPPORT_DIR", None)
+                os.environ.pop("XDG_DATA_HOME", None)
+                self.assertEqual(str(resolver_core.app_support_dir()), "/home/u/.local/share/VideoLink")
+
+    def test_linux_ignores_relative_xdg_data_home(self) -> None:
+        with (
+            mock.patch.object(resolver_core.platform, "system", return_value="Linux"),
+            mock.patch.object(resolver_core.Path, "home", return_value=resolver_core.Path("/home/u")),
+            mock.patch.dict(os.environ, {"XDG_DATA_HOME": "relative/data"}, clear=False),
+        ):
+            os.environ.pop("VIDEOLINK_APP_SUPPORT_DIR", None)
+            self.assertEqual(str(resolver_core.app_support_dir()), "/home/u/.local/share/VideoLink")
+
+    def test_macos_keeps_native_application_support(self) -> None:
+        with (
+            mock.patch.object(resolver_core.platform, "system", return_value="Darwin"),
+            mock.patch.object(resolver_core.Path, "home", return_value=resolver_core.Path("/Users/me")),
+        ):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("VIDEOLINK_APP_SUPPORT_DIR", None)
+                self.assertEqual(
+                    str(resolver_core.app_support_dir()),
+                    "/Users/me/Library/Application Support/VideoLink",
+                )
+
+
+class ShellPlatformHelperTests(unittest.TestCase):
+    """The shell scripts must resolve the same per-platform data locations."""
+
+    @staticmethod
+    def app_support_dir(system: str, env_updates: dict[str, str]) -> str:
+        environment = os.environ.copy()
+        environment.update(env_updates)
+        environment["VIDEOLINK_TEST_SYSTEM"] = system
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'uname() { printf "%s\\n" "$VIDEOLINK_TEST_SYSTEM"; }; '
+                'source scripts/_lib.sh; videolink_app_support_dir',
+            ],
+            cwd=os.path.dirname(__file__),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def test_shell_helper_keeps_macos_application_support(self) -> None:
+        self.assertEqual(
+            self.app_support_dir(
+                "Darwin",
+                {"HOME": "/Users/me", "VIDEOLINK_APP_SUPPORT_DIR": "", "XDG_DATA_HOME": ""},
+            ),
+            "/Users/me/Library/Application Support/VideoLink",
+        )
+
+    def test_shell_helper_uses_absolute_xdg_home(self) -> None:
+        self.assertEqual(
+            self.app_support_dir(
+                "Linux",
+                {"HOME": "/home/me", "VIDEOLINK_APP_SUPPORT_DIR": "", "XDG_DATA_HOME": "/data"},
+            ),
+            "/data/VideoLink",
+        )
+
+    def test_shell_helper_ignores_relative_xdg_home(self) -> None:
+        self.assertEqual(
+            self.app_support_dir(
+                "Linux",
+                {"HOME": "/home/me", "VIDEOLINK_APP_SUPPORT_DIR": "", "XDG_DATA_HOME": "data"},
+            ),
+            "/home/me/.local/share/VideoLink",
+        )
+
+    def test_shell_helper_expands_home_override(self) -> None:
+        self.assertEqual(
+            self.app_support_dir(
+                "Linux",
+                {"HOME": "/home/me", "VIDEOLINK_APP_SUPPORT_DIR": "~/custom data"},
+            ),
+            "/home/me/custom data",
+        )
+
+
+class LinuxPlayerTests(unittest.TestCase):
+    """The Linux path opens plain mpv, translating IINA-style mpv options."""
+
+    def setUp(self) -> None:
+        if videolink is None:
+            self.skipTest(f"videolink dependencies unavailable: {VIDEOLINK_IMPORT_ERROR}")
+
+    def test_mpv_command_translates_ipc_flag_and_forces_window(self) -> None:
+        with mock.patch.object(
+            videolink.shutil, "which",
+            side_effect=lambda name: "/usr/bin/mpv" if name == "mpv" else None,
+        ):
+            command = videolink.mpv_command(
+                "https://example.com/v.m3u8",
+                ["--mpv-input-ipc-server=/tmp/vl.sock", "--audio-file=https://a/x"],
+            )
+        self.assertEqual(command, [
+            "/usr/bin/mpv",
+            "--force-window=yes",
+            "--input-ipc-server=/tmp/vl.sock",
+            "--audio-file=https://a/x",
+            "https://example.com/v.m3u8",
+        ])
+
+    def test_mpv_command_absent_when_mpv_missing(self) -> None:
+        with mock.patch.object(videolink.shutil, "which", return_value=None):
+            self.assertIsNone(videolink.mpv_command("https://example.com/v.m3u8", []))
+
+    def test_iina_cli_commands_appends_mpv_without_separate_windows(self) -> None:
+        with (
+            mock.patch.object(videolink.sys, "platform", "linux"),
+            mock.patch.object(
+                videolink.shutil, "which",
+                side_effect=lambda name: "/usr/bin/mpv" if name == "mpv" else None,
+            ),
+        ):
+            commands = videolink.iina_cli_commands(
+                "https://example.com/v.m3u8", ["--mpv-input-ipc-server=/tmp/vl.sock"],
+            )
+        self.assertEqual(len(commands), 1)
+        mpv_cmd = commands[0]
+        self.assertNotIn("--separate-windows", mpv_cmd)
+        self.assertIn("--input-ipc-server=/tmp/vl.sock", mpv_cmd)
+
+    def test_open_in_iina_launches_mpv_detached_with_ipc_on_linux(self) -> None:
+        calls: list[list[str]] = []
+
+        class FakePopen:
+            def __init__(self, command, **kwargs):
+                calls.append(command)
+                self.returncode = None
+
+            def wait(self, timeout=None):
+                # Still playing after the probe window: a healthy mpv launch.
+                raise subprocess.TimeoutExpired(cmd="mpv", timeout=timeout)
+
+        with (
+            mock.patch.object(videolink.sys, "platform", "linux"),
+            mock.patch.object(
+                videolink.shutil, "which",
+                side_effect=lambda name: "/usr/bin/mpv" if name == "mpv" else None,
+            ),
+            mock.patch.object(videolink.subprocess, "Popen", FakePopen),
+            isolated_state_file(),
+        ):
+            opened = videolink.open_in_iina(
+                "https://example.com/v.m3u8", ipc_path="/tmp/vl.sock",
+            )
+
+        self.assertTrue(opened)
+        self.assertEqual(calls[0][0], "/usr/bin/mpv")
+        self.assertIn("--input-ipc-server=/tmp/vl.sock", calls[0])
+        self.assertNotIn("--separate-windows", calls[0])
+
+
+class NotifyTests(unittest.TestCase):
+    """notify() prefers native tooling, then libnotify, then printing."""
+
+    def setUp(self) -> None:
+        if videolink is None:
+            self.skipTest(f"videolink dependencies unavailable: {VIDEOLINK_IMPORT_ERROR}")
+
+    def test_notify_uses_notify_send_when_no_osascript(self) -> None:
+        calls: list[list[str]] = []
+        with (
+            mock.patch.object(
+                videolink.shutil, "which",
+                side_effect=lambda name: "/usr/bin/notify-send" if name == "notify-send" else None,
+            ),
+            mock.patch.object(
+                videolink.subprocess, "run",
+                side_effect=lambda command, **kw: calls.append(command)
+                or subprocess.CompletedProcess(command, 0),
+            ),
+        ):
+            videolink.notify("hello", title="Video Link")
+
+        self.assertEqual(calls, [["notify-send", "Video Link", "hello"]])
+
+
+class ClipboardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if videolink is None:
+            self.skipTest(f"videolink dependencies unavailable: {VIDEOLINK_IMPORT_ERROR}")
+
+    def test_read_clipboard_supports_xsel(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="https://example.com/video")
+
+        with (
+            mock.patch.object(
+                videolink.shutil, "which",
+                side_effect=lambda name: "/usr/bin/xsel" if name == "xsel" else None,
+            ),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+        ):
+            value = videolink.read_clipboard()
+
+        self.assertEqual(value, "https://example.com/video")
+        self.assertEqual(calls, [["xsel", "--clipboard", "--output"]])
+
+
 if __name__ == "__main__":
     unittest.main()

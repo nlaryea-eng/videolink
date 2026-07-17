@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Local subtitle backend selection and status service for VideoLink.
 
-The service is intentionally native-macOS first. It does not install system
-packages or download ASR models at import/startup time. Backends load models only
-when transcription is requested.
+The service supports macOS and Linux. It does not install system packages or
+download ASR models at import/startup time. Backends load models only when
+transcription is requested.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from resolver_core import app_support_dir
+
 try:
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
     from pydantic import BaseModel, Field
@@ -42,10 +44,7 @@ except ModuleNotFoundError as error:  # pragma: no cover - setup script fixes th
 APP_NAME = "VideoLink Subtitle Service"
 DEFAULT_PORT = int(os.environ.get("VIDEOLINK_SUBTITLE_PORT", "8765"))
 DEFAULT_LIVE_MODEL = os.environ.get("VIDEOLINK_LIVE_MODEL", "small").strip().lower()
-APP_SUPPORT_DIR = Path(os.environ.get(
-    "VIDEOLINK_APP_SUPPORT_DIR",
-    str(Path.home() / "Library/Application Support/VideoLink"),
-)).expanduser()
+APP_SUPPORT_DIR = app_support_dir()
 SUBTITLE_OUTPUT_DIR = Path(os.environ.get(
     "VIDEOLINK_SUBTITLE_DIR",
     str(APP_SUPPORT_DIR / "subtitles"),

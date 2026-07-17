@@ -2,8 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/_lib.sh
+source "${SCRIPT_DIR}/_lib.sh"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-APP_SUPPORT_DIR="${HOME}/Library/Application Support/VideoLink"
+APP_SUPPORT_DIR="$(videolink_app_support_dir)"
 VENV_DIR="${APP_SUPPORT_DIR}/venv"
 PY="${VENV_DIR}/bin/python"
 PORT="${VIDEOLINK_SUBTITLE_PORT:-8765}"

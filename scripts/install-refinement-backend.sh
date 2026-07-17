@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_SUPPORT_DIR="${HOME}/Library/Application Support/VideoLink"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/_lib.sh
+source "${SCRIPT_DIR}/_lib.sh"
+
+APP_SUPPORT_DIR="$(videolink_app_support_dir)"
 VENV_DIR="${APP_SUPPORT_DIR}/venv"
 PY="${VENV_DIR}/bin/python"
 
@@ -19,11 +23,13 @@ backend=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend)
-      backend="${2:-}"
+      [[ $# -ge 2 && -n "$2" ]] || { echo "error: --backend requires a name." >&2; exit 2; }
+      backend="$2"
       shift 2
       ;;
     --backend=*)
       backend="${1#*=}"
+      [[ -n "${backend}" ]] || { echo "error: --backend requires a name." >&2; exit 2; }
       shift
       ;;
     -h|--help)
