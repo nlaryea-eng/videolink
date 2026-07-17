@@ -113,6 +113,7 @@ SUBTITLE_SERVICE_URL = os.environ.get(
     "http://127.0.0.1:8765",
 ).rstrip("/")
 IINA_BUNDLED_CLI = "/Applications/IINA.app/Contents/MacOS/iina-cli"
+IINA_PLAYBACK_SPEED = "1.5"
 
 # VIDEOLINK_TIMINGS=1 prints per-stage wall-clock marks to stderr, measured
 # from process start — the closest observable proxy for the hotkey press.
@@ -200,9 +201,14 @@ def mpv_command(url: str, mpv_args: list[str]) -> list[str] | None:
     return [mpv_path, "--force-window=yes", *native_args, url]
 
 
-def iina_cli_commands(url: str, mpv_args: list[str]) -> list[list[str]]:
+def iina_cli_commands(
+    url: str,
+    mpv_args: list[str],
+    *,
+    separate_windows: bool = False,
+) -> list[list[str]]:
     commands = []
-    window_args = ["--separate-windows"] if mpv_args else []
+    window_args = ["--separate-windows"] if separate_windows else []
 
     for cli_name in ("iina", "iina-cli"):
         cli_path = shutil.which(cli_name)
@@ -316,18 +322,18 @@ def open_in_iina(
     ipc_path: str | None = None,
     audio_url: str | None = None,
 ) -> bool:
-    mpv_args = []
+    mpv_args = [f"--mpv-speed={IINA_PLAYBACK_SPEED}"]
     if ipc_path:
         mpv_args.append(f"--mpv-input-ipc-server={ipc_path}")
     if audio_url:
         mpv_args.append(f"--audio-file={audio_url}")
-    commands = iina_cli_commands(url, mpv_args)
+    commands = iina_cli_commands(url, mpv_args, separate_windows=bool(ipc_path or audio_url))
 
     # The macOS `open -a ... --args` path does not reliably pass mpv IPC options
     # to IINA, so use it only when subtitles are not requested.
     fallback_commands: list[list[str]] = []
     if not ipc_path and sys.platform == "darwin" and shutil.which("open"):
-        fallback_commands.append(["open", "-a", "IINA", url])
+        fallback_commands.append(["open", "-a", "IINA", url, "--args", *mpv_args])
 
     for command in [*commands, *fallback_commands]:
         if launch_player_command(command):

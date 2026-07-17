@@ -112,7 +112,34 @@ class VideoLinkCoreTests(unittest.TestCase):
             opened = videolink.open_in_iina("https://example.com/video.mp4")
 
         self.assertTrue(opened)
-        self.assertEqual(calls, [["open", "-a", "IINA", "https://example.com/video.mp4"]])
+        self.assertEqual(
+            calls,
+            [["open", "-a", "IINA", "https://example.com/video.mp4", "--args", "--mpv-speed=1.5"]],
+        )
+
+    def test_plain_iina_cli_launch_starts_at_default_speed(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_which(name: str) -> str | None:
+            return "/usr/local/bin/iina" if name == "iina" else None
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            mock.patch.object(videolink.shutil, "which", side_effect=fake_which),
+            mock.patch.object(videolink.os.path, "exists", return_value=False),
+            mock.patch.object(videolink.subprocess, "run", side_effect=fake_run),
+            isolated_state_file(),
+        ):
+            opened = videolink.open_in_iina("https://example.com/video.mp4")
+
+        self.assertTrue(opened)
+        self.assertEqual(
+            calls,
+            [["/usr/local/bin/iina", "--no-stdin", "--mpv-speed=1.5", "https://example.com/video.mp4"]],
+        )
 
     def test_subtitle_service_url_is_normalized(self) -> None:
         args = videolink.parse_args([
@@ -722,6 +749,7 @@ class LiveFlowTests(unittest.TestCase):
         self.assertTrue(opened)
         self.assertEqual(calls[0][0], "/usr/local/bin/iina",
                          "the NEW window must launch before the old one is touched")
+        self.assertIn("--mpv-speed=1.5", calls[0])
         self.assertIn(["kill", "4242"], calls)
         with open(state_file, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "/tmp/vl-new.sock")
@@ -748,6 +776,7 @@ class LiveFlowTests(unittest.TestCase):
             )
 
         self.assertTrue(opened)
+        self.assertIn("--mpv-speed=1.5", calls[0])
         self.assertIn("--audio-file=https://gv.example/audio-best", calls[0])
 
     def test_stream_resolution_overlaps_with_dialog_time(self) -> None:
