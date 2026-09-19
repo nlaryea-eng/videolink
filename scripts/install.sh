@@ -313,4 +313,5 @@ echo
 bold "Done."
 info "Resolve + open a video:      ./.venv/bin/python videolink.py <page-or-media-url>"
 info "Start the subtitle service:  scripts/run-subtitle-service.sh"
+info "Run it at login (autostart): scripts/install-autostart.sh"
 info "Live subtitles from the CLI: ./.venv/bin/python videolink.py --subtitle-auto <url>"

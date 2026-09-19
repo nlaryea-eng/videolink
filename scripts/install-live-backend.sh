@@ -18,6 +18,10 @@ Installs only the requested live ASR backend into:
   $(videolink_app_support_dir)/venv
 
 Default: mlx on Apple Silicon; faster-whisper elsewhere.
+
+The mlx backend prunes the unused torch dependency (~530MB) after install.
+Set VIDEOLINK_KEEP_TORCH=1 to keep it, e.g. to convert OpenAI Whisper
+weights to MLX format yourself.
 USAGE
 }
 
@@ -84,6 +88,13 @@ esac
 
 echo "Installing ${label} into ${VENV_DIR}"
 "${PY}" -m pip install "${package[@]}"
+
+# mlx-whisper declares torch but never imports it (only its unreferenced
+# weight-conversion module does), so pip drags in ~530MB we never execute.
+# Prune it unless something real needs it, or the caller opts out.
+if [[ "${backend}" == "mlx" && "${VIDEOLINK_KEEP_TORCH:-0}" != "1" ]]; then
+  "${PY}" "${SCRIPT_DIR}/_prune_torch.py"
+fi
 
 if "${PY}" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('${import_name}') else 1)"; then
   echo "${label} import check passed."

@@ -142,6 +142,17 @@ On Apple Silicon, the default live backend installer target is MLX Whisper:
 scripts/install-live-backend.sh --backend mlx
 ```
 
+`mlx-whisper` declares `torch` as a dependency but never imports it — the only
+module that does, `mlx_whisper/torch_whisper.py`, is unreferenced and exists to
+convert original OpenAI Whisper weights to MLX. VideoLink loads pre-converted
+`mlx-community/whisper-*-mlx` repos instead, so the installer prunes `torch` and
+its orphaned dependencies (~530MB) after installing. It refuses to prune when
+something genuinely needs torch, such as the optional WhisperX refinement
+backend. Set `VIDEOLINK_KEEP_TORCH=1` to keep it.
+
+Afterwards `pip check` reports `mlx-whisper requires torch, which is not
+installed`. That is expected and harmless.
+
 Other explicit live backend choices:
 
 ```sh
@@ -221,6 +232,32 @@ Start the service:
 ```sh
 scripts/run-subtitle-service.sh
 ```
+
+### Run at startup
+
+To have the service start automatically at login and stay up, install the
+autostart entry:
+
+```sh
+scripts/install-autostart.sh
+```
+
+On macOS this writes a launchd LaunchAgent
+(`~/Library/LaunchAgents/com.videolink.subtitle-service.plist`, `RunAtLoad` +
+`KeepAlive`); on Linux it writes a systemd user service
+(`~/.config/systemd/user/videolink-subtitle.service`, `Restart=on-failure`).
+Both wrap `run-subtitle-service.sh`, so the venv, port
+(`VIDEOLINK_SUBTITLE_PORT`), and backend selection are identical to a manual
+launch. Logs go to `<app-support>/logs/subtitle-service.{out,err}.log`.
+
+Remove it with:
+
+```sh
+scripts/install-autostart.sh --uninstall
+```
+
+On Linux, to keep the service running even when you are not logged in, enable
+lingering: `loginctl enable-linger "$USER"`.
 
 Check status:
 
