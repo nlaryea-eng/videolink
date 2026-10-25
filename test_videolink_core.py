@@ -1263,6 +1263,140 @@ class SubtitleSeekBehaviorTests(unittest.TestCase):
             setattr(session, key, value)
         return session
 
+    def test_player_clock_handles_speed_pause_resume_and_real_seeks(self):
+        # A long poll interval used to make ordinary 2x playback look like a seek.
+        cases = [
+            (1.0, False, 1.5, False, 2.5, False),
+            (1.5, False, 2.0, False, 3.5, False),
+            (2.0, False, 2.0, False, 8.0, False),
+            (1.5, False, 1.5, True, 0.5, False),
+            (1.5, True, 1.5, True, 0.0, False),
+            (1.5, True, 1.5, False, 2.0, False),
+            (2.0, False, 2.0, False, 13.0, True),
+            (1.5, True, 1.5, True, -5.0, True),
+        ]
+        for old_speed, old_pause, speed, pause, movement, seek in cases:
+            with self.subTest(speed=speed, pause=pause, movement=movement):
+                session = self.make_session(cursor_seconds=150.0,
+                    last_iina_position=100.0, last_player_sample_at=10.0,
+                    playback_speed=old_speed, playback_paused=old_pause)
+                elapsed = 4.0 if movement == 8.0 else 2.0
+                with (
+                    mock.patch.object(self.service, "iina_time_position", return_value=100.0 + movement),
+                    mock.patch.object(self.service.time, "monotonic", return_value=10.0 + elapsed),
+                    mock.patch.object(self.service, "iina_ipc_request", side_effect=[
+                        {"data": speed}, {"data": pause}]),
+                ):
+                    target = self.service.detect_seek_or_stop(session)
+                self.assertEqual(target is not None, seek)
+                self.assertEqual(session.playback_speed, speed)
+                self.assertEqual(session.playback_paused, pause)
+
+    def test_lost_player_clock_does_not_invent_seek(self):
+        session = self.make_session(last_iina_position=100.0, last_player_sample_at=10.0)
+        with mock.patch.object(self.service, "iina_time_position", return_value=None):
+            self.assertIsNone(self.service.detect_seek_or_stop(session))
+        self.assertEqual(session.last_iina_position, 100.0)
+        self.assertEqual(session.last_player_sample_at, 10.0)
+
+    def test_lookahead_scales_with_speed_without_changing_timestamps(self):
+        session = self.make_session()
+        for speed, expected in [(1.0, 5.0), (1.5, 7.5), (2.0, 10.0), (10.0, 15.0)]:
+            session.playback_speed = speed
+            self.assertEqual(self.service.caption_lookahead_seconds(session), expected)
+        result = self.service.TranscriptionResult(text="hello", segments=[
+            self.service.TranscriptionSegment(start=0.5, end=1.5, text="hello")])
+        cue = self.service.make_caption_cues(session, result, 100.0, 2.5)[0]
+        self.assertEqual((cue.start, cue.end), (100.5, 101.5))
+
+    def test_wait_ahead_is_interruptible_during_pause(self):
+        session = self.make_session(playback_paused=True)
+        chunk = self.service.AudioChunk(b"pcm", 200.0, 2.5)
+        with (
+            mock.patch.object(self.service, "iina_time_position", return_value=100.0),
+            mock.patch.object(session.cancel_event, "wait", side_effect=lambda _: session.cancel_event.set()),
+        ):
+            self.assertIsNone(self.service.wait_for_caption_window(session, chunk))
+        self.assertTrue(session.cancel_event.is_set())
+
+    def run_worker_chunks(self, session, chunks, positions):
+        import queue
+        session.audio_queue = mock.Mock()
+        session.audio_queue.get.side_effect = chunks + [queue.Empty()]
+        session.ffmpeg_process = mock.Mock()
+        session.ffmpeg_process.poll.return_value = 0
+        processed = []
+        with (
+            mock.patch.object(self.service, "iina_time_position", side_effect=positions),
+            mock.patch.object(self.service, "process_asr_chunk", side_effect=lambda _, c: processed.append(c)),
+        ):
+            self.service.asr_worker_thread(session, 0.0)
+        return processed
+
+    def test_paused_wall_time_does_not_drop_valid_audio(self):
+        session = self.make_session(start_time=time.time() - 3600, playback_paused=True)
+        chunk = self.service.AudioChunk(b"pcm", 100.0, 2.5)
+        self.assertEqual(self.run_worker_chunks(session, [chunk], [100.0, 100.0]), [chunk])
+        self.assertEqual(session.latency_seconds, 0.0)
+        self.assertEqual(session.caption_ahead_seconds, 2.5)
+        self.assertEqual(session.dropped_stale_audio_seconds, 0.0)
+
+    def test_worker_drops_only_stale_audio_preserving_upcoming_chunks(self):
+        session = self.make_session(last_transcription_text="words before seek")
+        stale = self.service.AudioChunk(b"old", 90.0, 2.5)
+        fresh = self.service.AudioChunk(b"new", 100.0, 2.5)
+        self.assertEqual(self.run_worker_chunks(session, [stale, fresh], [100.0, 100.0, 103.0]), [fresh])
+        self.assertEqual(session.dropped_stale_audio_seconds, 2.5)
+        self.assertEqual(session.latency_seconds, 0.5)
+        self.assertEqual(session.covered_ranges, [[100.0, 102.5]])
+        self.assertEqual(session.last_transcription_text, "")
+
+    def test_worker_reports_unknown_latency_without_player_clock(self):
+        session = self.make_session(start_time=time.time() - 3600)
+        chunk = self.service.AudioChunk(b"pcm", 100.0, 2.5)
+        self.assertEqual(self.run_worker_chunks(session, [chunk], [None, None]), [chunk])
+        self.assertIsNone(session.latency_seconds)
+        self.assertIsNone(session.caption_ahead_seconds)
+
+    def test_caption_readiness_is_measured_against_player_clock(self):
+        service = self.service
+        session = self.make_session()
+        session.backend.transcribe_chunk = mock.Mock(return_value=service.TranscriptionResult(
+            text="spoken words", segments=[service.TranscriptionSegment(start=0.5, end=1.5, text="spoken words")]))
+        with (
+            mock.patch.object(service, "calculate_dbfs", return_value=-10.0),
+            mock.patch.object(service, "iina_time_position", return_value=101.0),
+            mock.patch.object(service, "write_srt"),
+        ):
+            service.process_asr_chunk(session, service.AudioChunk(b"pcm", 100.0, 2.5))
+        self.assertEqual(session.last_caption_lateness_seconds, 0.5)
+        self.assertEqual(session.late_caption_count, 1)
+        self.assertEqual(session.captions[0].start, 100.5)
+
+    def test_cancelled_inflight_transcription_cannot_publish_old_cues(self):
+        session = self.make_session()
+        def finish_old_chunk(*args):
+            session.cancel_event.set()
+            return self.service.TranscriptionResult(text="old words", segments=[])
+        session.backend.transcribe_chunk = finish_old_chunk
+        with mock.patch.object(self.service, "calculate_dbfs", return_value=-10.0):
+            self.service.process_asr_chunk(session, self.service.AudioChunk(b"pcm", 100.0, 2.5))
+        self.assertEqual(session.captions, [])
+        self.assertTrue(session.render_queue.empty())
+
+    def test_decoder_backpressure_keeps_future_audio(self):
+        import queue
+        session = self.make_session()
+        session.audio_queue = mock.Mock()
+        session.audio_queue.put.side_effect = [queue.Full(), None]
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(self.service, "read_pcm_chunk", side_effect=[b"x" * 32000, b""]):
+            self.service.ffmpeg_reader_thread(session, process, 32000)
+        self.assertEqual(session.audio_queue.put.call_count, 2)
+        self.assertEqual(session.dropped_stale_audio_seconds, 0.0)
+        self.assertEqual(session.audio_queue.put.call_args.args[0].start_seconds, 0.0)
+
     def test_small_rewind_is_detected(self) -> None:
         """IINA's default arrow-key seek is 5s; the old 8s threshold missed it."""
         session = self.make_session(cursor_seconds=101.0, last_iina_position=100.0)

@@ -887,6 +887,12 @@ class SubtitleSession:
     start_time: float = field(default_factory=time.time)
     cursor_seconds: float = 0.0
     last_iina_position: float | None = None
+    last_player_sample_at: float | None = None
+    playback_speed: float = 1.0
+    playback_paused: bool = False
+    caption_ahead_seconds: float | None = None
+    last_caption_lateness_seconds: float | None = None
+    late_caption_count: int = 0
     iina_failures_after_active: int = 0
     iina_subtitle_track_added: bool = False
     # Merged [start, end] media-time intervals that have already been
@@ -993,6 +999,11 @@ def session_status_payload(session: SubtitleSession) -> dict[str, Any]:
         "backend": clean_mapping(asdict(session.backend_info)),
         "processed_until": session.processed_until,
         "latency_seconds": session.latency_seconds,
+        "playback_speed": session.playback_speed,
+        "playback_paused": session.playback_paused,
+        "caption_ahead_seconds": session.caption_ahead_seconds,
+        "last_caption_lateness_seconds": session.last_caption_lateness_seconds,
+        "late_caption_count": session.late_caption_count,
         "media_url": masked_url,
         "session_id": session.id,
         "srt_path": session.srt_path,
@@ -1049,6 +1060,11 @@ def service_status_payload() -> dict[str, Any]:
         "backend": clean_mapping(asdict(info)),
         "processed_until": 0.0,
         "latency_seconds": None,
+        "playback_speed": None,
+        "playback_paused": None,
+        "caption_ahead_seconds": None,
+        "last_caption_lateness_seconds": None,
+        "late_caption_count": 0,
         "media_url": None,
         "session_id": None,
         "srt_path": None,
@@ -1185,14 +1201,14 @@ def ffmpeg_reader_thread(session: SubtitleSession, process: subprocess.Popen[byt
         if not pcm:
             break
         duration = len(pcm) / BYTES_PER_PCM_SECOND
-        try:
-            session.audio_queue.put(AudioChunk(pcm, cursor, duration), timeout=1.0)
-        except queue.Full:
-            # Queue backed up - drop this chunk rather than blocking ffmpeg's
-            # stdout pipe indefinitely. Still advance the cursor so later
-            # chunks' timestamps track real playback time instead of drifting
-            # behind by the dropped duration.
-            session.dropped_stale_audio_seconds += duration
+        # Backpressure bounds decoded audio without throwing away future chunks
+        # while playback is paused or the lookahead window is full.
+        while not session.cancel_event.is_set():
+            try:
+                session.audio_queue.put(AudioChunk(pcm, cursor, duration), timeout=0.1)
+                break
+            except queue.Full:
+                continue
         cursor += duration
 
 def make_caption_cues(
@@ -1242,6 +1258,9 @@ def process_asr_chunk(session: SubtitleSession, chunk: AudioChunk):
         session.request.task,
     )
 
+    if session.cancel_event.is_set():
+        return
+
     if session.detected_language is None and result.language:
         if session.language_candidate == result.language:
             session.language_candidate_count += 1
@@ -1274,6 +1293,10 @@ def process_asr_chunk(session: SubtitleSession, chunk: AudioChunk):
 
     cues = make_caption_cues(session, result, chunk.start_seconds, chunk.duration)
     if cues:
+        position = iina_time_position(session.ipc_socket_path)
+        if position is not None:
+            session.last_caption_lateness_seconds = max(0.0, position - cues[0].start)
+            session.late_caption_count += sum(cue.start < position for cue in cues)
         session.accepted_caption_count += len(cues)
         session.captions.extend(cues)
         write_srt(session.captions, session.srt_path)
@@ -1290,11 +1313,26 @@ def process_asr_chunk(session: SubtitleSession, chunk: AudioChunk):
                 srt_path=session.srt_path,
             )
 
-def asr_worker_thread(session: SubtitleSession, start_offset: float):
-    latency_over_start = None
-    processed_duration = 0.0
-    asr_start_time = time.time()
+def caption_lookahead_seconds(session: SubtitleSession) -> float:
+    # Two chunks of playback headroom, bounded in media seconds. Speed changes
+    # affect how far ahead to prepare, never the SRT timestamps themselves.
+    return min(15.0, max(session.request.chunk_seconds, 2 * session.request.chunk_seconds * session.playback_speed))
 
+
+def wait_for_caption_window(session: SubtitleSession, chunk: AudioChunk) -> float | None:
+    """Bound work ahead of playback; pausing does not accumulate clock lag."""
+    while not session.cancel_event.is_set():
+        position = iina_time_position(session.ipc_socket_path)
+        if position is None or chunk.start_seconds <= position + caption_lookahead_seconds(session):
+            return position
+        session.cancel_event.wait(0.1)
+    return None
+
+
+def asr_worker_thread(session: SubtitleSession, start_offset: float):
+    del start_offset  # AudioChunk carries absolute media timestamps.
+    processed_duration = 0.0
+    processing_time = 0.0
     while not session.cancel_event.is_set():
         try:
             chunk = session.audio_queue.get(timeout=1.0)
@@ -1303,56 +1341,35 @@ def asr_worker_thread(session: SubtitleSession, start_offset: float):
                 break
             continue
 
-        now = time.time()
-        media_elapsed = chunk.start_seconds - start_offset
-        real_elapsed = now - session.start_time
-        latency = max(0.0, real_elapsed - media_elapsed)
+        position = wait_for_caption_window(session, chunk)
+        if session.cancel_event.is_set():
+            break
+        # Drop only audio demonstrably behind the player. Never drain the queue:
+        # it contains the upcoming audio needed to rebuild the lookahead buffer.
+        if position is not None and chunk.start_seconds + chunk.duration < position - session.request.iina_preroll_seconds:
+            session.dropped_stale_audio_seconds += chunk.duration
+            # The next retained chunk is no longer contiguous with the previous
+            # transcript. Do not strip legitimate words using pre-seek context.
+            session.last_transcription_text = ""
+            continue
 
-        processing_time = now - asr_start_time
-        processing_speed_ratio = processed_duration / processing_time if processing_time > 0 else 1.0
-        session.processing_speed_ratio = processing_speed_ratio
-
-        if processing_speed_ratio < 1.0 or latency > 5.0:
-            if latency_over_start is None:
-                latency_over_start = now
-            elif now - latency_over_start > 5.0:
-                # drop stale queued audio
-                while not session.audio_queue.empty():
-                    try:
-                        dropped = session.audio_queue.get_nowait()
-                        session.dropped_stale_audio_seconds += dropped.duration
-                    except queue.Empty:
-                        break
-                latency_over_start = None
-                continue
-        else:
-            latency_over_start = None
-
-        process_start = time.time()
+        process_start = time.monotonic()
         process_asr_chunk(session, chunk)
-        process_end = time.time()
-
-        with SESSION_LOCK:
-            # Silent/rejected chunks count too: the audio was processed and
-            # simply produced no cue, so a seek back here needs no restart.
-            mark_covered(
-                session.covered_ranges,
-                chunk.start_seconds,
-                chunk.start_seconds + chunk.duration,
-            )
-
+        processing_time += time.monotonic() - process_start
+        if session.cancel_event.is_set():
+            break
         processed_duration += chunk.duration
+        session.processing_speed_ratio = processed_duration / max(processing_time, 0.001)
+        with SESSION_LOCK:
+            mark_covered(session.covered_ranges, chunk.start_seconds, chunk.start_seconds + chunk.duration)
         session.cursor_seconds = chunk.start_seconds + chunk.duration
         session.processed_until = session.cursor_seconds
-        session.latency_seconds = latency
+        position = iina_time_position(session.ipc_socket_path)
+        session.latency_seconds = None if position is None else max(0.0, position - session.cursor_seconds)
+        session.caption_ahead_seconds = None if position is None else max(0.0, session.cursor_seconds - position)
+        queue_event(session, "chunk_processed", processed_until=session.cursor_seconds,
+                    caption_count=len(session.captions), latency_seconds=session.latency_seconds)
 
-        queue_event(
-            session,
-            "chunk_processed",
-            processed_until=session.cursor_seconds,
-            caption_count=len(session.captions),
-            latency_seconds=latency,
-        )
 
 def renderer_thread(session: SubtitleSession) -> None:
     if not session.ipc_socket_path:
@@ -1452,9 +1469,32 @@ def detect_seek_or_stop(session: SubtitleSession) -> float | None:
     if position is None:
         return None
 
+    now = time.monotonic()
     previous = session.last_iina_position
+    previous_at = session.last_player_sample_at
+    old_rate = 0.0 if session.playback_paused else session.playback_speed
+    speed_response = iina_ipc_request(session.ipc_socket_path, ["get_property", "speed"], timeout_seconds=0.5)
+    pause_response = iina_ipc_request(session.ipc_socket_path, ["get_property", "pause"], timeout_seconds=0.5)
+    speed = (speed_response or {}).get("data")
+    paused = (pause_response or {}).get("data")
+    if isinstance(speed, (int, float)) and not isinstance(speed, bool) and 0 < speed <= 100:
+        session.playback_speed = float(speed)
+    if isinstance(paused, bool):
+        session.playback_paused = paused
+    new_rate = 0.0 if session.playback_paused else session.playback_speed
     session.last_iina_position = position
+    session.last_player_sample_at = now
     target = max(0.0, position - session.request.iina_preroll_seconds)
+    if previous is not None and previous_at is not None:
+        elapsed = max(0.0, now - previous_at)
+        movement = position - previous
+        # A speed/pause transition may have happened anywhere between samples.
+        # Accept the full expected interval rather than inventing a seek.
+        low = min(old_rate, new_rate) * elapsed
+        high = max(old_rate, new_rate) * elapsed
+        if movement < low - IINA_REWIND_THRESHOLD_SECONDS or movement > high + IINA_SEEK_THRESHOLD_SECONDS:
+            session.behind_polls = 0
+            return target
 
     if position > session.cursor_seconds + IINA_BEHIND_RESYNC_SECONDS:
         # Pipeline fell behind (ASR slower than real-time); catch up to live.
@@ -1467,7 +1507,7 @@ def detect_seek_or_stop(session: SubtitleSession) -> float | None:
             return target
         return None
     session.behind_polls = 0
-    if previous is None:
+    if previous is None or previous_at is not None:
         return None
     if position < previous - IINA_REWIND_THRESHOLD_SECONDS:
         # Rewound.
@@ -1530,10 +1570,7 @@ def run_caption_pipeline(session: SubtitleSession) -> None:
     process: subprocess.Popen[bytes] | None = None
     try:
         start_offset = resolve_initial_start_offset(session)
-        # asr_worker_thread measures latency as wall-time-since-start minus
-        # media-time-since-start-offset. After a seek restart both clocks must
-        # restart together, or the stale-audio dropper reads the entire
-        # pre-seek playback as latency and drains every queued chunk.
+        # Keep status timestamps fresh; sync decisions use the player's clock.
         session.start_time = time.time()
         session.cursor_seconds = start_offset
         write_srt(session.captions, session.srt_path)
@@ -1762,6 +1799,10 @@ def perform_seek(session_id: str, position_seconds: float) -> dict[str, Any]:
         session.iina_rendering_active = False
         session.first_rendered_caption_at = None
         session.last_iina_position = None
+        session.last_player_sample_at = None
+        session.latency_seconds = None
+        session.caption_ahead_seconds = None
+        session.last_caption_lateness_seconds = None
         session.behind_polls = 0
         session.cancel_event.clear()
     finally:

@@ -87,6 +87,27 @@ Generated subtitles and logs live in `~/Library/Application Support/VideoLink`.
 `VIDEOLINK_SUBTITLE_PORT` overrides port 8765. Pass environment overrides when
 starting the service; autostart only records the port by default.
 
+## Playback sync
+
+Caption timestamps stay in the video's original media timeline at every playback
+speed. The service reads IINA's position, speed, and pause state to distinguish
+normal playback from a seek. Covered rewinds keep their existing subtitles;
+uncovered seeks restart transcription near the new position and suppress results
+from cancelled work. A running model inference must still finish before restart.
+
+Transcription builds a small speed-aware lookahead buffer. Pausing stops work
+once that window is filled, and the decoder waits instead of dropping future
+audio. If playback overtakes transcription, only demonstrably stale audio is
+skipped. This buffer helps absorb speed changes; it cannot make a slow backend
+sustain a playback rate faster than its transcription throughput.
+
+Session status reports `playback_speed`, `playback_paused`,
+`caption_ahead_seconds`, and `latency_seconds` in media seconds. Lag is unknown
+when the player clock is unavailable. `last_caption_lateness_seconds` and
+`late_caption_count` measure whether captions were generated after their intended
+start, not proof of on-screen display timing. Subtitle reload success still
+indicates that IINA accepted the track, not that a viewer saw a particular cue.
+
 ## Other profiles
 
 Linux playback through mpv and the existing alternative transcription backends
