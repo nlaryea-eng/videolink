@@ -57,3 +57,23 @@ videolink_pick_python() {
   done
   return 1
 }
+
+# One environment shared by Shortcuts, the service, and regression tests.
+videolink_repo_dir() {
+  cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
+}
+
+videolink_uv() {
+  local repo candidate
+  repo="$(videolink_repo_dir)"
+  for candidate in "${VIDEOLINK_UV:-}" "${repo}/.venv/bin/uv" "${HOME}/.local/bin/uv" /opt/homebrew/bin/uv; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
+  command -v uv 2>/dev/null || {
+    echo "error: install uv, then rerun scripts/install.sh (https://docs.astral.sh/uv/)." >&2
+    return 1
+  }
+}

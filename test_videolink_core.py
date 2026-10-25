@@ -914,7 +914,7 @@ class SubtitleServiceStatusTests(unittest.TestCase):
         try:
             self.service = importlib.import_module("subtitle_service")
         except (ModuleNotFoundError, SystemExit) as error:
-            self.skipTest(f"subtitle service dependencies unavailable: {error}")
+            self.fail(f"subtitle service dependencies unavailable: {error}; run scripts/install.sh")
 
     def tearDown(self) -> None:
         if not hasattr(self, "service"):
@@ -1224,7 +1224,7 @@ class SubtitleSeekBehaviorTests(unittest.TestCase):
         try:
             self.service = importlib.import_module("subtitle_service")
         except (ModuleNotFoundError, SystemExit) as error:
-            self.skipTest(f"subtitle service dependencies unavailable: {error}")
+            self.fail(f"subtitle service dependencies unavailable: {error}; run scripts/install.sh")
 
     def tearDown(self) -> None:
         if not hasattr(self, "service"):
