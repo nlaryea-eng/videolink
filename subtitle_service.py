@@ -58,6 +58,7 @@ IINA_SEEK_THRESHOLD_SECONDS = float(os.environ.get("VIDEOLINK_SEEK_THRESHOLD_SEC
 IINA_REWIND_THRESHOLD_SECONDS = float(os.environ.get("VIDEOLINK_REWIND_THRESHOLD_SECONDS", "2.0"))
 IINA_SEEK_POLL_SECONDS = float(os.environ.get("VIDEOLINK_SEEK_POLL_SECONDS", "0.5"))
 DEFAULT_IINA_PREROLL_SECONDS = float(os.environ.get("VIDEOLINK_SUBTITLE_PREROLL_SECONDS", "0.75"))
+IINA_STALL_RESYNC_SECONDS = 15.0
 IINA_BEHIND_RESYNC_SECONDS = float(os.environ.get("VIDEOLINK_BEHIND_RESYNC_SECONDS", "3.0"))
 SUPPORTED_MODELS = ("tiny", "base", "small", "medium")
 SUPPORTED_TASKS = {"transcribe", "translate"}
@@ -849,15 +850,6 @@ def range_is_covered(ranges: list[list[float]], start: float, end: float) -> boo
     )
 
 
-def truncate_coverage(ranges: list[list[float]], position: float) -> None:
-    kept: list[list[float]] = []
-    for item in ranges:
-        if item[0] >= position:
-            continue
-        kept.append([item[0], min(item[1], position)])
-    ranges[:] = kept
-
-
 @dataclass
 class SubtitleSession:
     id: str
@@ -888,6 +880,7 @@ class SubtitleSession:
     cursor_seconds: float = 0.0
     last_iina_position: float | None = None
     last_player_sample_at: float | None = None
+    last_pipeline_progress_at: float = field(default_factory=time.monotonic)
     playback_speed: float = 1.0
     playback_paused: bool = False
     caption_ahead_seconds: float | None = None
@@ -895,11 +888,11 @@ class SubtitleSession:
     late_caption_count: int = 0
     iina_failures_after_active: int = 0
     iina_subtitle_track_added: bool = False
-    # Merged [start, end] media-time intervals that have already been
-    # transcribed. Seeks landing inside coverage don't need a pipeline restart:
-    # the SRT already holds cues for that region.
+    # Cached media-time intervals survive seeks. The cursor tracks this
+    # pipeline's current position, independently of other cached regions.
     covered_ranges: list[list[float]] = field(default_factory=list)
     behind_polls: int = 0
+    player_missing_polls: int = 0
     # True while perform_seek tears down the pipeline for a restart, so the
     # pipeline's cleanup knows not to unload the ASR model.
     restarting: bool = False
@@ -1045,7 +1038,10 @@ def service_status_payload() -> dict[str, Any]:
         session_ids = [session.id for session in sessions]
 
     active_latest = next(
-        (session for session in reversed(sessions) if session.state in ACTIVE_SESSION_STATES),
+        (session for session in reversed(sessions)
+         if session.state in ACTIVE_SESSION_STATES
+         or (session.state == "completed" and session.pipeline_task
+             and session.pipeline_task.is_alive() and not session.cancel_event.is_set())),
         None,
     )
     if active_latest is not None:
@@ -1196,7 +1192,8 @@ def open_ffmpeg_pcm(session: SubtitleSession, start_seconds: float) -> subproces
 
 def ffmpeg_reader_thread(session: SubtitleSession, process: subprocess.Popen[bytes], chunk_bytes: int):
     cursor = session.cursor_seconds
-    while not session.cancel_event.is_set() and process.poll() is None:
+    while not session.cancel_event.is_set():
+        # An exited decoder can still have unread audio in its stdout pipe.
         pcm = read_pcm_chunk(process, chunk_bytes)
         if not pcm:
             break
@@ -1298,7 +1295,14 @@ def process_asr_chunk(session: SubtitleSession, chunk: AudioChunk):
             session.last_caption_lateness_seconds = max(0.0, position - cues[0].start)
             session.late_caption_count += sum(cue.start < position for cue in cues)
         session.accepted_caption_count += len(cues)
+        # Keep cached cues elsewhere, including future regions visited before a
+        # rewind. Replace an overlapping region only once new cues are ready.
+        chunk_end = chunk.start_seconds + chunk.duration
+        session.captions = [cue for cue in session.captions
+                            if cue.end <= chunk.start_seconds or cue.start >= chunk_end]
         session.captions.extend(cues)
+        session.captions.sort(key=lambda cue: (cue.start, cue.end))
+        renumber_captions(session.captions)
         write_srt(session.captions, session.srt_path)
 
         for cue in cues:
@@ -1337,7 +1341,11 @@ def asr_worker_thread(session: SubtitleSession, start_offset: float):
         try:
             chunk = session.audio_queue.get(timeout=1.0)
         except queue.Empty:
-            if session.ffmpeg_process and session.ffmpeg_process.poll() is not None:
+            # The reader may still be draining an exited decoder's stdout.
+            if session.ffmpeg_thread is not None:
+                if not session.ffmpeg_thread.is_alive():
+                    break
+            elif session.ffmpeg_process and session.ffmpeg_process.poll() is not None:
                 break
             continue
 
@@ -1351,6 +1359,7 @@ def asr_worker_thread(session: SubtitleSession, start_offset: float):
             # The next retained chunk is no longer contiguous with the previous
             # transcript. Do not strip legitimate words using pre-seek context.
             session.last_transcription_text = ""
+            session.last_pipeline_progress_at = time.monotonic()
             continue
 
         process_start = time.monotonic()
@@ -1364,6 +1373,7 @@ def asr_worker_thread(session: SubtitleSession, start_offset: float):
             mark_covered(session.covered_ranges, chunk.start_seconds, chunk.start_seconds + chunk.duration)
         session.cursor_seconds = chunk.start_seconds + chunk.duration
         session.processed_until = session.cursor_seconds
+        session.last_pipeline_progress_at = time.monotonic()
         position = iina_time_position(session.ipc_socket_path)
         session.latency_seconds = None if position is None else max(0.0, position - session.cursor_seconds)
         session.caption_ahead_seconds = None if position is None else max(0.0, session.cursor_seconds - position)
@@ -1467,7 +1477,18 @@ def detect_seek_or_stop(session: SubtitleSession) -> float | None:
     """
     position = iina_time_position(session.ipc_socket_path)
     if position is None:
+        # At EOF the clock may disappear while the player/socket remains open.
+        # Only an unreachable player is a reason to retire the seek monitor.
+        response = iina_ipc_request(session.ipc_socket_path, ["get_property", "mpv-version"], timeout_seconds=0.5)
+        if iina_command_succeeded(response):
+            session.player_missing_polls = 0
+            return None
+        session.player_missing_polls += 1
+        if session.player_missing_polls >= 6:
+            update_session_state(session, "stopped", message="Player connection lost; live captions stopped.")
+            stop_session(session)
         return None
+    session.player_missing_polls = 0
 
     now = time.monotonic()
     previous = session.last_iina_position
@@ -1496,11 +1517,12 @@ def detect_seek_or_stop(session: SubtitleSession) -> float | None:
             session.behind_polls = 0
             return target
 
-    if position > session.cursor_seconds + IINA_BEHIND_RESYNC_SECONDS:
-        # Pipeline fell behind (ASR slower than real-time); catch up to live.
-        # Playback can transiently overshoot the cursor while a chunk is
-        # mid-transcription, so require two consecutive behind polls before
-        # tearing the pipeline down for a restart.
+    if (position > session.cursor_seconds + IINA_BEHIND_RESYNC_SECONDS
+            and now - session.last_pipeline_progress_at >= IINA_STALL_RESYNC_SECONDS):
+        # Lag alone is not a seek. HLS startup and inference can take several
+        # seconds; restarting during warmup repeatedly cancels the first chunk.
+        # The worker skips stale audio itself while making progress. Restart
+        # automatically only after sustained stagnation, confirmed twice.
         session.behind_polls += 1
         if session.behind_polls >= 2:
             session.behind_polls = 0
@@ -1521,8 +1543,8 @@ def detect_seek_or_stop(session: SubtitleSession) -> float | None:
 def seek_target_is_covered(session: SubtitleSession, position: float) -> bool:
     """True when everything between the seek target and the live transcription
     edge is already transcribed - the SRT can serve the seek without a restart.
-    A target past the cursor is never covered (coverage never outruns the
-    cursor, because restarts truncate coverage at their start offset).
+    Cached regions past the current cursor are retained but may need a new
+    pipeline to bridge an untranscribed gap.
     """
     with SESSION_LOCK:
         return range_is_covered(session.covered_ranges, position, session.cursor_seconds)
@@ -1535,7 +1557,7 @@ def seek_watcher_thread(session: SubtitleSession) -> None:
         time.sleep(IINA_SEEK_POLL_SECONDS)
         if session.cancel_event.is_set():
             break
-        if session.state not in ("starting", "running"):
+        if session.state not in ("starting", "running", "completed"):
             continue
         seek_to = detect_seek_or_stop(session)
         if seek_to is None or session.cancel_event.is_set():
@@ -1572,6 +1594,7 @@ def run_caption_pipeline(session: SubtitleSession) -> None:
         start_offset = resolve_initial_start_offset(session)
         # Keep status timestamps fresh; sync decisions use the player's clock.
         session.start_time = time.time()
+        session.last_pipeline_progress_at = time.monotonic()
         session.cursor_seconds = start_offset
         write_srt(session.captions, session.srt_path)
         queue_event(
@@ -1617,6 +1640,10 @@ def run_caption_pipeline(session: SubtitleSession) -> None:
                 raise BackendUnavailable(stderr or f"ffmpeg exited with status {return_code}")
             update_session_state(session, "completed", message="Subtitle processing completed.")
             queue_event(session, "session_completed", srt_path=session.srt_path)
+            if session.ipc_socket_path:
+                # EOF is not player closure. Keep the renderer and seek watcher
+                # alive so replaying an uncovered region can resume ASR.
+                session.cancel_event.wait()
     except Exception as error:
         update_session_state(session, "failed", last_error=str(error), message=f"Subtitle processing failed: {error}")
         queue_event(session, "session_failed", error=str(error))
@@ -1648,7 +1675,7 @@ def stop_other_active_sessions(keep_id: str | None = None) -> None:
     # keybind) keeps its ffmpeg + loaded Whisper model running forever
     # alongside every new one, compounding memory/CPU/network use.
     with SESSION_LOCK:
-        active = [s for sid, s in SESSIONS.items() if s.state in ACTIVE_SESSION_STATES and sid != keep_id]
+        active = [s for sid, s in SESSIONS.items() if s.state in (ACTIVE_SESSION_STATES | {"completed"}) and sid != keep_id]
     for session in active:
         stop_session(session)
 
@@ -1657,7 +1684,9 @@ def prune_finished_sessions() -> None:
     # SESSIONS is never otherwise cleared, so a long-running service would
     # accumulate one entry (plus its full caption list) per video watched.
     with SESSION_LOCK:
-        finished_ids = [sid for sid, s in SESSIONS.items() if s.state in TERMINAL_SESSION_STATES]
+        finished_ids = [sid for sid, s in SESSIONS.items()
+                        if s.state in TERMINAL_SESSION_STATES
+                        and not (s.pipeline_task and s.pipeline_task.is_alive())]
         if len(finished_ids) <= MAX_FINISHED_SESSIONS_KEPT:
             return
         finished_ids.sort(key=lambda sid: SESSIONS[sid].start_time)
@@ -1776,9 +1805,8 @@ def perform_seek(session_id: str, position_seconds: float) -> dict[str, Any]:
         session.request.start_offset_seconds = position_seconds
         session.cursor_seconds = position_seconds
         session.processed_until = position_seconds
-        session.captions = [cue for cue in session.captions if cue.start < position_seconds]
-        renumber_captions(session.captions)
-        truncate_coverage(session.covered_ranges, position_seconds)
+        # Seeking changes the transcription cursor, not the media timeline.
+        # Keep the entire SRT and coverage cache for immediate future rewinds.
         # The first post-seek chunk is not contiguous with the pre-seek text;
         # letting remove_overlap compare against it can silently strip
         # legitimate leading words from the first caption after the seek.
@@ -1804,6 +1832,7 @@ def perform_seek(session_id: str, position_seconds: float) -> dict[str, Any]:
         session.caption_ahead_seconds = None
         session.last_caption_lateness_seconds = None
         session.behind_polls = 0
+        session.player_missing_polls = 0
         session.cancel_event.clear()
     finally:
         session.restarting = False

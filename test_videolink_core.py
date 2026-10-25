@@ -260,6 +260,28 @@ def fake_youtube_dl(info: dict) -> mock.MagicMock:
 
 
 class ResolverCoreTests(unittest.TestCase):
+    def test_google_search_redirect_resolves_publisher(self):
+        from urllib.parse import quote
+        target = "https://www.bloomberg.com/news/videos/2026-10-06/dalio-sees-possibility-of-us-debt-crisis-within-3-years-video"
+        for key in ("url", "q"):
+            with self.subTest(key=key):
+                wrapped = "https://www.google.com/url?sa=t&" + key + "=" + quote(target, safe="") + "&usg=tracking"
+                self.assertEqual(resolver_core.normalize_page_url(wrapped), target)
+
+    def test_google_redirect_does_not_unwrap_other_pages_or_unsafe_targets(self):
+        urls = ["https://www.google.com/search?q=https://example.com/video",
+                "https://www.google.com.evil.example/url?url=https://example.com/video",
+                "https://www.google.com/url?url=file:///etc/hosts",
+                "https://www.google.com/url?q=ordinary+search"]
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertEqual(resolver_core.normalize_page_url(url), url)
+
+    def test_normalize_preserves_direct_urls_and_adds_missing_scheme(self):
+        target = "https://example.com/video?a=1&b=2#chapter"
+        self.assertEqual(resolver_core.normalize_page_url(" " + target + " "), target)
+        self.assertEqual(resolver_core.normalize_page_url("example.com/video"), "https://example.com/video")
+
     """Pure resolver-core behavior that should survive the daemon migration."""
 
     def test_scored_candidates_prioritize_platform_and_jsonld_over_previews(self) -> None:
@@ -1397,6 +1419,122 @@ class SubtitleSeekBehaviorTests(unittest.TestCase):
         self.assertEqual(session.dropped_stale_audio_seconds, 0.0)
         self.assertEqual(session.audio_queue.put.call_args.args[0].start_seconds, 0.0)
 
+    def test_completed_session_still_watches_for_seeks(self):
+        session = self.make_session(state="completed")
+        def detect(sess):
+            sess.cancel_event.set()
+            return None
+        with (
+            mock.patch.object(self.service.time, "sleep"),
+            mock.patch.object(self.service, "detect_seek_or_stop", side_effect=detect) as poll,
+        ):
+            self.service.seek_watcher_thread(session)
+        poll.assert_called_once_with(session)
+
+    def test_decoder_drains_audio_after_process_exit(self):
+        session = self.make_session()
+        process = mock.Mock()
+        process.poll.return_value = 0
+        with mock.patch.object(self.service, "read_pcm_chunk", side_effect=[b"x" * 32000, b""]):
+            self.service.ffmpeg_reader_thread(session, process, 32000)
+        self.assertEqual(session.audio_queue.get_nowait().duration, 1.0)
+
+    def test_worker_waits_for_reader_to_drain_exited_decoder(self):
+        import queue
+        session = self.make_session()
+        session.ffmpeg_thread = mock.Mock()
+        session.ffmpeg_thread.is_alive.side_effect = [True, False]
+        session.ffmpeg_process = mock.Mock()
+        session.ffmpeg_process.poll.return_value = 0
+        chunk = self.service.AudioChunk(b"pcm", 100.0, 2.5)
+        session.audio_queue = mock.Mock()
+        session.audio_queue.get.side_effect = [queue.Empty(), chunk, queue.Empty()]
+        with (
+            mock.patch.object(self.service, "iina_time_position", return_value=100.0),
+            mock.patch.object(self.service, "process_asr_chunk") as process_chunk,
+        ):
+            self.service.asr_worker_thread(session, 100.0)
+        process_chunk.assert_called_once_with(session, chunk)
+
+    def test_eof_keeps_caption_recovery_alive_until_player_stops(self):
+        service = self.service
+        session = self.make_session()
+        worker = mock.Mock()
+        worker.is_alive.return_value = False
+        decoder = mock.Mock()
+        decoder.poll.return_value = 0
+        decoder.returncode = 0
+        decoder.stderr.read.return_value = b""
+        def wait_for_player():
+            self.assertEqual(session.state, "completed")
+            self.assertFalse(session.backend.closed)
+            self.assertFalse(session.cancel_event.is_set())
+            session.cancel_event.set()
+        with (
+            mock.patch.object(service, "write_srt"),
+            mock.patch.object(service, "resolve_initial_start_offset", return_value=0.0),
+            mock.patch.object(service, "open_ffmpeg_pcm", return_value=decoder),
+            mock.patch.object(service.threading, "Thread", return_value=worker),
+            mock.patch.object(session.cancel_event, "wait", side_effect=wait_for_player) as wait,
+        ):
+            service.run_caption_pipeline(session)
+        wait.assert_called_once()
+        self.assertTrue(session.backend.closed)
+
+    def test_completed_session_recovers_uncovered_seek(self):
+        service = self.service
+        session = self.make_session(state="completed", cursor_seconds=48.5, covered_ranges=[[35.0,48.5]])
+        with (
+            mock.patch.object(service.time, "sleep"),
+            mock.patch.object(service, "detect_seek_or_stop", return_value=10.0),
+            mock.patch.object(service, "perform_seek") as seek,
+        ):
+            service.seek_watcher_thread(session)
+        seek.assert_called_once_with(session.id, 10.0)
+
+    def test_new_session_stops_completed_player_monitor(self):
+        service = self.service
+        old = self.make_session(state="completed")
+        service.SESSIONS[old.id] = old
+        service.stop_other_active_sessions(keep_id="new-session")
+        self.assertTrue(old.cancel_event.is_set())
+
+    def test_missing_eof_clock_with_live_socket_keeps_monitor_alive(self):
+        session = self.make_session(state="completed")
+        with (
+            mock.patch.object(self.service, "iina_time_position", return_value=None),
+            mock.patch.object(self.service, "iina_ipc_request", return_value={"error":"success", "data":"mpv"}),
+        ):
+            for _ in range(10):
+                self.service.detect_seek_or_stop(session)
+        self.assertFalse(session.cancel_event.is_set())
+        self.assertEqual(session.player_missing_polls, 0)
+
+    def test_lost_player_clock_eventually_releases_completed_session(self):
+        session = self.make_session(state="completed")
+        with mock.patch.object(self.service, "iina_time_position", return_value=None):
+            for _ in range(6):
+                self.service.detect_seek_or_stop(session)
+        self.assertEqual(session.state, "stopped")
+        self.assertTrue(session.cancel_event.is_set())
+
+    def test_retranscription_keeps_other_cached_regions_sorted(self):
+        service = self.service
+        session = self.make_session()
+        session.captions = [service.CaptionCue(1, 10.0, 12.0, "earlier"),
+                            service.CaptionCue(2, 100.0, 102.0, "replace"),
+                            service.CaptionCue(3, 200.0, 202.0, "future")]
+        session.backend.transcribe_chunk = mock.Mock(return_value=service.TranscriptionResult(
+            text="fresh words", segments=[service.TranscriptionSegment(0.0, 2.0, "fresh words")]))
+        with (
+            mock.patch.object(service, "calculate_dbfs", return_value=-10.0),
+            mock.patch.object(service, "iina_time_position", return_value=100.0),
+            mock.patch.object(service, "write_srt"),
+        ):
+            service.process_asr_chunk(session, service.AudioChunk(b"pcm", 100.0, 2.5))
+        self.assertEqual([c.text for c in session.captions], ["earlier", "fresh words", "future"])
+        self.assertEqual([c.index for c in session.captions], [1, 2, 3])
+
     def test_small_rewind_is_detected(self) -> None:
         """IINA's default arrow-key seek is 5s; the old 8s threshold missed it."""
         session = self.make_session(cursor_seconds=101.0, last_iina_position=100.0)
@@ -1417,8 +1555,34 @@ class SubtitleSeekBehaviorTests(unittest.TestCase):
         with mock.patch.object(self.service, "iina_time_position", return_value=100.8):
             self.assertIsNone(self.service.detect_seek_or_stop(session))
 
+    def test_hls_warmup_does_not_restart_before_first_chunk(self):
+        # Live BILD trace: normal 1.5x progress triggered restarts every ~2s.
+        session = self.make_session(cursor_seconds=20.0, last_iina_position=20.0,
+                                    last_player_sample_at=100.0,
+                                    last_pipeline_progress_at=100.0, playback_speed=1.5)
+        for now in (102.0, 104.0, 106.0, 108.0):
+            position = 20.0 + (now - 100.0) * 1.5
+            with (
+                mock.patch.object(self.service.time, "monotonic", return_value=now),
+                mock.patch.object(self.service, "iina_time_position", return_value=position),
+                mock.patch.object(self.service, "iina_ipc_request", side_effect=[{"data":1.5}, {"data":False}]),
+            ):
+                self.assertIsNone(self.service.detect_seek_or_stop(session))
+        self.assertEqual(session.behind_polls, 0)
+
+    def test_actual_seek_during_warmup_still_restarts_immediately(self):
+        session = self.make_session(cursor_seconds=20.0, last_iina_position=20.0,
+                                    last_player_sample_at=100.0, last_pipeline_progress_at=100.0)
+        with (
+            mock.patch.object(self.service.time, "monotonic", return_value=101.0),
+            mock.patch.object(self.service, "iina_time_position", return_value=40.0),
+            mock.patch.object(self.service, "iina_ipc_request", side_effect=[{"data":1.5}, {"data":False}]),
+        ):
+            self.assertAlmostEqual(self.service.detect_seek_or_stop(session), 39.25)
+
     def test_behind_resync_needs_two_consecutive_polls(self) -> None:
-        session = self.make_session(cursor_seconds=100.0, last_iina_position=99.0)
+        session = self.make_session(cursor_seconds=100.0, last_iina_position=99.0,
+                                    last_pipeline_progress_at=time.monotonic() - 20.0)
         with mock.patch.object(
             self.service, "iina_time_position", side_effect=[104.0, 105.0]
         ):
@@ -1427,7 +1591,8 @@ class SubtitleSeekBehaviorTests(unittest.TestCase):
         self.assertAlmostEqual(seek_to, 105.0 - session.request.iina_preroll_seconds)
 
     def test_transient_behind_overshoot_does_not_restart(self) -> None:
-        session = self.make_session(cursor_seconds=100.0, last_iina_position=99.0)
+        session = self.make_session(cursor_seconds=100.0, last_iina_position=99.0,
+                                    last_pipeline_progress_at=time.monotonic() - 20.0)
         with mock.patch.object(
             self.service, "iina_time_position", side_effect=[104.0, 104.5]
         ):
@@ -1505,7 +1670,7 @@ class SubtitleSeekBehaviorTests(unittest.TestCase):
         )
         session.captions = [
             service.CaptionCue(index=1, start=20.0, end=22.0, text="keep"),
-            service.CaptionCue(index=2, start=80.0, end=82.0, text="drop"),
+            service.CaptionCue(index=2, start=80.0, end=82.0, text="future cached"),
         ]
         with service.SESSION_LOCK:
             service.SESSIONS[session.id] = session
@@ -1521,8 +1686,8 @@ class SubtitleSeekBehaviorTests(unittest.TestCase):
         ):
             service.perform_seek(session.id, 50.0)
 
-        self.assertEqual([cue.text for cue in session.captions], ["keep"])
-        self.assertEqual(session.covered_ranges, [[10.0, 50.0]])
+        self.assertEqual([cue.text for cue in session.captions], ["keep", "future cached"])
+        self.assertEqual(session.covered_ranges, [[10.0, 120.0]])
         self.assertEqual(session.last_transcription_text, "")
         self.assertTrue(
             session.iina_subtitle_track_added,

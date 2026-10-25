@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, NamedTuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 
 def app_support_dir() -> Path:
@@ -213,7 +213,23 @@ def fast_path_videos(page_url: str) -> list[tuple[str, str]] | None:
 def normalize_page_url(raw_url: str) -> str:
     page_url = raw_url.strip()
     if page_url and not urlparse(page_url).scheme:
-        return f"https://{page_url.lstrip('/')}"
+        page_url = f"https://{page_url.lstrip('/')}"
+    # Search result links should resolve the publisher, not Google's redirect
+    # HTML/consent page. Restrict unwrapping to known hosts and HTTP targets.
+    google_hosts = {"google.com", "www.google.com", "google.de", "www.google.de",
+                    "google.co.uk", "www.google.co.uk"}
+    seen = {page_url}
+    for _ in range(5):
+        parsed = urlparse(page_url)
+        if parsed.hostname not in google_hosts or parsed.path != "/url":
+            break
+        query = parse_qs(parsed.query)
+        target = next((value for key in ("url", "q") for value in query.get(key, [])
+                       if looks_like_url(value)), None)
+        if target is None or target in seen:
+            break
+        seen.add(target)
+        page_url = target
     return page_url
 
 

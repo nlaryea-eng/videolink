@@ -93,12 +93,22 @@ Caption timestamps stay in the video's original media timeline at every playback
 speed. The service reads IINA's position, speed, and pause state to distinguish
 normal playback from a seek. Covered rewinds keep their existing subtitles;
 uncovered seeks restart transcription near the new position and suppress results
-from cancelled work. A running model inference must still finish before restart.
+from cancelled work. Cached captions survive every seek, including later regions
+visited before a rewind. Re-transcribing a region replaces its cues only after
+new captions are ready. A running model inference must still finish before restart.
+
+Reaching transcription EOF keeps the seek monitor and subtitle renderer alive
+while IINA remains open. This allows seeking back into previously skipped audio
+without reopening the video. Decoder stdout is drained through EOF so buffered
+final audio is not lost. Closing the player, explicitly stopping subtitles, or
+starting another session ends that monitor and releases the backend.
 
 Transcription builds a small speed-aware lookahead buffer. Pausing stops work
 once that window is filled, and the decoder waits instead of dropping future
 audio. If playback overtakes transcription, only demonstrably stale audio is
-skipped. This buffer helps absorb speed changes; it cannot make a slow backend
+skipped. Automatic catch-up restarts require at least 15 seconds without
+pipeline progress, so HLS startup and model inference are not repeatedly cancelled.
+Actual player seeks still trigger immediate recovery. This buffer helps absorb speed changes; it cannot make a slow backend
 sustain a playback rate faster than its transcription throughput.
 
 Session status reports `playback_speed`, `playback_paused`,
